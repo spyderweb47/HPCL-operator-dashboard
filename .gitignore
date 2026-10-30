@@ -1,0 +1,19 @@
+# dependencies
+/node_modules
+
+# build output
+/dist
+/src-tauri/target
+/src-tauri/gen/schemas
+
+# local data used by `npm run bridge`
+/.dev-data
+
+# misc
+.DS_Store
+*.pem
+*.log
+
+# cloud credentials: never commit
+.env*
+src-tauri/cloud.json
