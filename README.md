@@ -36,18 +36,25 @@ The local file is `%APPDATA%\com.hpcl.operator\operator.db`: SQLite in WAL mode.
 
 ## Setting the cloud database
 
-The app looks for the MongoDB connection string in this order:
+Nothing is built into the installer. A fresh install runs as **This PC only** until the cloud is set up:
 
-1. **`cloud.json`** in `%APPDATA%\com.hpcl.operator\`. You can change it after install without rebuilding:
-   ```json
-   { "mongodbUri": "mongodb+srv://USER:PASSWORD@cluster0.xxxx.mongodb.net/hpcl_dealership", "database": "hpcl_dealership" }
-   ```
-2. The `HPCL_MONGODB_URI` environment variable, and optionally `HPCL_MONGODB_DB`.
-3. **Baked in at build time:** `HPCL_MONGODB_URI="mongodb+srv://..." npm run app:build`.
+1. Open **Settings → Cloud Database**.
+2. Paste the connection string from MongoDB Atlas (**Connect → Drivers**), for example
+   `mongodb+srv://myuser:<db_password>@cluster0.xxxx.mongodb.net/`.
+3. Type the **password** in the Password box. You only need to fill in Username if it differs from the one in the string. Special characters like `@`, `:` and `/` are handled for you.
+4. Optionally set the **database name** (default `hpcl_dealership`), then click **Test connection** and **Save & connect**.
 
-The database name comes from `database`, then the URI path, then the default `hpcl_dealership`. Without any of these the app runs as "This PC only".
+It takes effect immediately; no restart is needed.
 
-**Security note.** The connection string ends up on the PC, either in the file or inside the `.exe`. Create a dedicated MongoDB user with **readWrite on this one database only** for the app. In Atlas, allow the office IP or `0.0.0.0/0` under Network Access. If Atlas blocks the IP, the app shows `Offline` (connection timeout) rather than a login error.
+- **New password:** type it and save; nothing else changes. Leaving Password blank keeps the saved one.
+- **Different cluster or database:** everything on this PC (the last 180 days, delivery boys and catalog) is uploaded to the new one automatically.
+- **Turn off cloud sync:** the app keeps working on this PC only.
+
+The settings are saved only on this PC, in `%APPDATA%\com.hpcl.operator\cloud.json`. For development, the `HPCL_MONGODB_URI` and `HPCL_MONGODB_DB` environment variables are used when that file doesn't exist.
+
+**Atlas checklist:**
+- Create a database user with **readWrite** on the database only.
+- Under **Network Access**, allow the office IP or `0.0.0.0/0`. A blocked IP shows as `Offline`; hover over the status pill or open Settings to see the exact reason.
 
 ## Cloud data structure (for the Owner/Admin dashboard)
 
@@ -131,7 +138,6 @@ Tests: `cargo test --manifest-path src-tauri/Cargo.toml --lib` (business rules a
 **On a Windows PC** (simplest), install Rust, Node, and the "Desktop development with C++" build tools, then run:
 ```bash
 npm install
-set HPCL_MONGODB_URI=mongodb+srv://...      # optional: bake in the cloud address
 npm run app:build
 ```
 The output is `src-tauri\target\release\bundle\nsis\HPCL Operator_1.0.0_x64-setup.exe` (plus an `.msi`).
@@ -152,6 +158,7 @@ The installer needs Microsoft WebView2. It's built into Windows 10 and 11, and t
 ```
 src/                 React UI (Vite + Tailwind v4): pages/, components/, lib/api.ts (backend calls)
 src-tauri/src/
+  cloud_config.rs    Cloud settings (Settings page / cloud.json), connection string handling
   store.rs           Business rules over SQLite (entries, edit/delete audit, day end, delivery boys)
   cloud.rs           Sync worker, cloud indexes, restore, history-from-cloud, pruning
   core.rs            Machine ID, shared state, the single `call` command dispatcher

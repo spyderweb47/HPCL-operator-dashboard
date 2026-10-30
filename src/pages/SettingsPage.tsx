@@ -4,6 +4,7 @@ import { mutate } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
 import type { AppInfoDTO, DeliveryBoyDTO, SyncStatusDTO } from "@/lib/types";
+import { CloudSettings } from "@/components/CloudSettings";
 import { Card } from "@/components/DayEndViews";
 import { LoadError } from "@/components/LoadError";
 
@@ -15,6 +16,7 @@ export function SettingsPage() {
         <p className="text-sm text-slate-500">Saved on this PC and synced to the cloud.</p>
       </div>
       <DeliveryBoysSettings />
+      <CloudSettings />
       <DeviceInfo />
     </div>
   );
@@ -275,7 +277,9 @@ function DeviceInfo() {
           {SYNC_TEXT[sync.state]}
           {sync.pending > 0 && ` · ${sync.pending} change${sync.pending === 1 ? "" : "s"} waiting`}
           {sync.lastSyncAt && <span className="text-slate-400"> · last synced {formatDateTime(sync.lastSyncAt)}</span>}
-          {sync.state === "error" && sync.lastError && <span className="mt-1 block text-xs text-red-600">{sync.lastError}</span>}
+          {(sync.state === "error" || sync.state === "offline") && sync.lastError && (
+            <span className="mt-1 block break-all text-xs text-red-600">{sync.lastError}</span>
+          )}
         </span>
       ),
     ],

@@ -18,10 +18,10 @@ export function SyncBadge() {
       icon: CloudOff,
       text: `Offline${pending ? ` · ${pending}` : ""}`,
       tone: "bg-amber-400/25 text-amber-100",
-      title: `Saved safely on this PC. It uploads automatically when the internet is back.\n${last}`,
+      title: `Saved safely on this PC. It uploads automatically when the connection is back.\n${last}${s.lastError ? `\n\n${s.lastError}` : ""}`,
     },
     error: { icon: TriangleAlert, text: `Sync problem${pending ? ` · ${pending}` : ""}`, tone: "bg-red-500/30 text-red-50", title: `${s.lastError ?? ""}\n${last}` },
-    not_configured: { icon: HardDrive, text: "This PC only", tone: "bg-white/10 text-blue-100", title: "Cloud sync is not set up. Data is saved on this PC." },
+    not_configured: { icon: HardDrive, text: "This PC only", tone: "bg-white/10 text-blue-100", title: "Cloud sync is not set up (Settings → Cloud Database). Data is saved on this PC." },
   }[s.state];
   const Icon = view.icon;
   return (

@@ -95,3 +95,14 @@ export type AppInfoDTO = {
 export type ActionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string };
 
 export type Totals = { cashIn: number; cashOut: number; net: number; count: number };
+
+/** Saved cloud settings, as safe to show: never contains the password. */
+export type CloudSettingsDTO = {
+  configured: boolean;
+  source: "settings" | "environment" | null;
+  connectionString: string;
+  username: string;
+  hasPassword: boolean;
+  host: string;
+  database: string;
+};

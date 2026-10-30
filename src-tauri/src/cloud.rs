@@ -11,18 +11,17 @@ use mongodb::error::ErrorKind;
 use mongodb::options::{ClientOptions, IndexOptions};
 use mongodb::{Client, Database, IndexModel};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
-use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+use crate::cloud_config::{self, CloudConfig};
 use crate::core::Core;
 use crate::model::*;
 use crate::store::{self, db_err, R};
 use crate::{db, time};
 
-pub const DEFAULT_DATABASE: &str = "hpcl_dealership";
 const TRANSACTIONS: &str = "transactions";
 const DAY_END_LOGS: &str = "dayendlogs";
 const PRODUCTS: &str = "products";
@@ -36,53 +35,6 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(5 * 60);
 const PRUNE_EVERY_HOURS: i64 = 6;
 
 // ---------------------------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct CloudConfig {
-    pub uri: String,
-    pub database: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigFile {
-    mongodb_uri: String,
-    #[serde(default)]
-    database: Option<String>,
-}
-
-/// First match wins: `cloud.json` in the app config folder, the `HPCL_MONGODB_URI` environment
-/// variable, then the URI baked in at build time (`HPCL_MONGODB_URI=... npm run app:build`).
-pub fn load_config(config_dir: &Path) -> Option<CloudConfig> {
-    let from_file = std::fs::read_to_string(config_dir.join("cloud.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<ConfigFile>(&s).ok())
-        .map(|f| (f.mongodb_uri, f.database));
-    let (uri, database) = from_file
-        .or_else(|| std::env::var("HPCL_MONGODB_URI").ok().map(|u| (u, std::env::var("HPCL_MONGODB_DB").ok())))
-        .or_else(|| option_env!("HPCL_MONGODB_URI").map(|u| (u.to_string(), option_env!("HPCL_MONGODB_DB").map(String::from))))?;
-    let uri = uri.trim().to_string();
-    if uri.is_empty() {
-        return None;
-    }
-    let database = database
-        .filter(|d| !d.trim().is_empty())
-        .or_else(|| database_from_uri(&uri))
-        .unwrap_or_else(|| DEFAULT_DATABASE.into());
-    Some(CloudConfig { uri, database })
-}
-
-/// `mongodb+srv://user:pw@host/<db>?opts` -> `<db>`
-fn database_from_uri(uri: &str) -> Option<String> {
-    let rest = uri.split_once("://")?.1;
-    let path = rest.split_once('/')?.1;
-    let name = path.split('?').next()?.trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-// ---------------------------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------------------------
 
@@ -94,9 +46,15 @@ struct Inner {
 
 pub struct SyncShared {
     pub notify: Notify,
-    pub config: Option<CloudConfig>,
+    config: Mutex<Option<CloudConfig>>,
+    /// Bumped whenever the cloud settings change, so work for the old address is discarded.
+    generation: AtomicU64,
     inner: Mutex<Inner>,
-    remote: Mutex<Option<Database>>,
+    remote: Mutex<Option<(u64, Database)>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl SyncShared {
@@ -104,22 +62,48 @@ impl SyncShared {
         let state = if config.is_some() { "connecting" } else { "not_configured" };
         SyncShared {
             notify: Notify::new(),
-            config,
+            config: Mutex::new(config),
+            generation: AtomicU64::new(0),
             inner: Mutex::new(Inner { state, last_sync_at: None, last_error: None }),
             remote: Mutex::new(None),
         }
     }
 
-    fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn config(&self) -> Option<CloudConfig> {
+        lock(&self.config).clone()
     }
 
-    fn set_state(&self, state: &'static str) {
-        self.inner().state = state;
+    /// Switch to new cloud settings (or none) right away; the worker reconnects immediately.
+    pub fn set_config(&self, config: Option<CloudConfig>) {
+        let state = if config.is_some() { "connecting" } else { "not_configured" };
+        *lock(&self.config) = config;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.remote) = None;
+        *self.inner() = Inner { state, last_sync_at: None, last_error: None };
+        self.notify.notify_one();
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        lock(&self.inner)
+    }
+
+    /// Status updates from a sync round only count if the settings didn't change meanwhile.
+    fn update(&self, gen: u64, f: impl FnOnce(&mut Inner)) {
+        let mut inner = self.inner();
+        if self.generation() == gen {
+            f(&mut inner);
+        }
     }
 
     fn remote(&self) -> Option<Database> {
-        self.remote.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        match &*lock(&self.remote) {
+            Some((gen, db)) if *gen == self.generation() => Some(db.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -159,7 +143,10 @@ fn describe(e: &SyncError) -> (bool, String) {
             ErrorKind::ServerSelection { .. }
             | ErrorKind::Io(_)
             | ErrorKind::DnsResolve { .. }
-            | ErrorKind::ConnectionPoolCleared { .. } => (true, format!("Cannot reach the cloud database: {e}")),
+            | ErrorKind::ConnectionPoolCleared { .. } => (
+                true,
+                format!("Cannot reach the cloud database. Check the internet, and that Atlas Network Access allows this PC's IP. ({e})"),
+            ),
             ErrorKind::Authentication { message, .. } => (false, format!("Cloud login failed: {message}")),
             ErrorKind::InvalidArgument { message, .. } => (false, format!("Cloud address is invalid: {message}")),
             _ => (false, format!("Cloud sync failed: {e}")),
@@ -172,26 +159,35 @@ fn describe(e: &SyncError) -> (bool, String) {
 // ---------------------------------------------------------------------------------------------
 
 pub async fn run(core: Arc<Core>) {
-    let Some(cfg) = core.sync.config.clone() else { return };
     let mut failures = 0usize;
     let mut last_heartbeat: Option<Instant> = None;
+    let mut seen_gen = u64::MAX;
     loop {
-        let wait = match cycle(&core, &cfg, &mut last_heartbeat).await {
-            Ok(()) => {
-                failures = 0;
-                IDLE_CHECK
-            }
-            Err(e) => {
-                let (offline, message) = describe(&e);
-                eprintln!("[sync] {message}");
-                {
-                    let mut inner = core.sync.inner();
-                    inner.state = if offline { "offline" } else { "error" };
-                    inner.last_error = Some(message);
+        let gen = core.sync.generation();
+        if gen != seen_gen {
+            seen_gen = gen;
+            failures = 0;
+            last_heartbeat = None;
+        }
+        let wait = match core.sync.config() {
+            // Nothing to do until the operator saves cloud settings (which wakes us).
+            None => Duration::from_secs(3600),
+            Some(cfg) => match cycle(&core, &cfg, gen, &mut last_heartbeat).await {
+                Ok(()) => {
+                    failures = 0;
+                    IDLE_CHECK
                 }
-                failures += 1;
-                Duration::from_secs([5, 10, 20, 30][(failures - 1).min(3)])
-            }
+                Err(e) => {
+                    let (offline, message) = describe(&e);
+                    eprintln!("[sync] {message}");
+                    core.sync.update(gen, |inner| {
+                        inner.state = if offline { "offline" } else { "error" };
+                        inner.last_error = Some(message);
+                    });
+                    failures += 1;
+                    Duration::from_secs([5, 10, 20, 30][(failures - 1).min(3)])
+                }
+            },
         };
         tokio::select! {
             _ = core.sync.notify.notified() => {
@@ -203,12 +199,16 @@ pub async fn run(core: Arc<Core>) {
     }
 }
 
-async fn cycle(core: &Arc<Core>, cfg: &CloudConfig, last_heartbeat: &mut Option<Instant>) -> Result<(), SyncError> {
+async fn cycle(core: &Arc<Core>, cfg: &CloudConfig, gen: u64, last_heartbeat: &mut Option<Instant>) -> Result<(), SyncError> {
     let db = match core.sync.remote() {
         Some(db) => db,
         None => {
             let db = connect(cfg).await?;
-            *core.sync.remote.lock().unwrap_or_else(|e| e.into_inner()) = Some(db.clone());
+            core.with_db(|c| retarget(c, &cloud_config::target_key(cfg)))?;
+            if core.sync.generation() != gen {
+                return Ok(()); // settings changed while connecting; the next round uses the new ones
+            }
+            *lock(&core.sync.remote) = Some((gen, db.clone()));
             db
         }
     };
@@ -224,11 +224,51 @@ async fn cycle(core: &Arc<Core>, cfg: &CloudConfig, last_heartbeat: &mut Option<
     }
     core.with_db(|c| maybe_prune(c))?;
 
-    let mut inner = core.sync.inner();
-    inner.state = "online";
-    inner.last_error = None;
-    inner.last_sync_at = Some(time::now_iso());
+    core.sync.update(gen, |inner| {
+        inner.state = "online";
+        inner.last_error = None;
+        inner.last_sync_at = Some(time::now_iso());
+    });
     Ok(())
+}
+
+/// First connection to a different cluster/database: upload everything on this PC there, and
+/// bring back whatever that database already has for this machine.
+fn retarget(conn: &mut Connection, key: &str) -> R<()> {
+    if db::meta_get(conn, "cloud_target").map_err(db_err)?.as_deref() == Some(key) {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(db_err)?;
+    for table in ["transactions", "day_end_logs", "products", "delivery_boys"] {
+        tx.execute(&format!("UPDATE {table} SET synced_version = 0"), []).map_err(db_err)?;
+    }
+    tx.execute("DELETE FROM meta WHERE key = 'restore_done'", []).map_err(db_err)?;
+    db::meta_set(&tx, "cloud_target", key).map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    eprintln!("[sync] new cloud target {key}: re-uploading local data");
+    Ok(())
+}
+
+/// Settings → "Test connection": connect, log in and read the database, without saving anything.
+pub async fn test_connection(cfg: &CloudConfig) -> R<String> {
+    let attempt = async {
+        let mut opts = ClientOptions::parse(&cfg.uri).await?;
+        opts.server_selection_timeout = Some(Duration::from_secs(10));
+        opts.connect_timeout = Some(Duration::from_secs(10));
+        let db = Client::with_options(opts)?.database(&cfg.database);
+        db.run_command(doc! { "ping": 1 }).await?;
+        db.list_collection_names().await?;
+        Ok::<_, mongodb::error::Error>(())
+    };
+    match tokio::time::timeout(Duration::from_secs(25), attempt).await {
+        Ok(Ok(())) => Ok(format!(
+            "Connected to {} · database “{}”.",
+            cloud_config::describe(Some(cfg)).host,
+            cfg.database
+        )),
+        Ok(Err(e)) => Err(describe(&SyncError::Remote(e)).1),
+        Err(_) => Err("No answer from the cloud database within 25 seconds.".into()),
+    }
 }
 
 async fn connect(cfg: &CloudConfig) -> mongodb::error::Result<Database> {
@@ -511,7 +551,7 @@ async fn push_all(core: &Core, db: &Database) -> Result<usize, SyncError> {
         if batch.is_empty() {
             return Ok(total);
         }
-        core.sync.set_state("syncing");
+        core.sync.inner().state = "syncing";
         let results: Vec<_> = stream::iter(batch)
             .map(|u| {
                 let coll = db.collection::<Document>(u.collection);
@@ -766,7 +806,7 @@ pub async fn history_day(core: &Core, date: &str) -> R<HistoryDayDTO> {
         transactions: txs,
         day_end,
     };
-    if date >= cutoff.as_str() || core.sync.config.is_none() {
+    if date >= cutoff.as_str() || core.sync.config().is_none() {
         return Ok(result);
     }
     match cloud_day(core, date).await {

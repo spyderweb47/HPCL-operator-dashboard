@@ -5,10 +5,11 @@ use rusqlite::Connection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::cloud::{self, SyncShared};
+use crate::cloud_config::{self, CloudInput};
 use crate::model::AppInfo;
 use crate::store::{self, db_err, R};
 use crate::{db, time};
@@ -17,6 +18,7 @@ pub struct Core {
     db: Mutex<Connection>,
     pub info: AppInfo,
     pub sync: SyncShared,
+    config_dir: PathBuf,
 }
 
 impl Core {
@@ -25,17 +27,17 @@ impl Core {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("Cannot create {}: {e}", data_dir.display()))?;
         let conn = db::open(&data_dir.join("operator.db")).map_err(db_err)?;
         let machine_id = machine_id(&conn).map_err(db_err)?;
-        let config = cloud::load_config(config_dir);
+        let config = cloud_config::load(config_dir);
         let info = AppInfo {
             machine_id,
             device_name: gethostname::gethostname().to_string_lossy().into_owned(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             retention_days: time::RETENTION_DAYS,
-            cloud_configured: config.is_some(),
-            cloud_database: config.as_ref().map(|c| c.database.clone()),
+            cloud_configured: false,
+            cloud_database: None,
             data_dir: data_dir.display().to_string(),
         };
-        Ok(Arc::new(Core { db: Mutex::new(conn), info, sync: SyncShared::new(config) }))
+        Ok(Arc::new(Core { db: Mutex::new(conn), info, sync: SyncShared::new(config), config_dir: config_dir.to_path_buf() }))
     }
 
     /// Short, synchronous access to the local database. Never held across an `.await`.
@@ -107,7 +109,29 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
         res
     };
     match cmd {
-        "app_info" => out(&core.info),
+        "app_info" => {
+            let cfg = core.sync.config();
+            out(AppInfo { cloud_configured: cfg.is_some(), cloud_database: cfg.map(|c| c.database), ..core.info.clone() })
+        }
+
+        "get_cloud_settings" => out(cloud_config::describe(core.sync.config().as_ref())),
+        "test_cloud_settings" => {
+            let input: CloudInput = arg(args)?;
+            let cfg = cloud_config::compose(&input, core.sync.config().as_ref())?;
+            out(cloud::test_connection(&cfg).await?)
+        }
+        "save_cloud_settings" => {
+            let input: CloudInput = arg(args)?;
+            let cfg = cloud_config::compose(&input, core.sync.config().as_ref())?;
+            cloud_config::save(&core.config_dir, &cfg)?;
+            core.sync.set_config(Some(cfg));
+            out(cloud_config::describe(core.sync.config().as_ref()))
+        }
+        "clear_cloud_settings" => {
+            cloud_config::clear(&core.config_dir)?;
+            core.sync.set_config(cloud_config::load(&core.config_dir));
+            out(cloud_config::describe(core.sync.config().as_ref()))
+        }
         "sync_status" => out(cloud::status(core)),
         "sync_now" => {
             core.sync.notify.notify_one();

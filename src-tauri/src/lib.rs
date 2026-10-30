@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod cloud_config;
 pub mod core;
 pub mod db;
 pub mod model;
