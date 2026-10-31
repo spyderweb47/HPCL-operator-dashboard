@@ -155,21 +155,22 @@ The installer needs Microsoft WebView2. It's built into Windows 10 and 11, and t
 
 ## Windows 7, 8 and 8.1
 
-Each release has two installers:
+Each release has three installers:
 
 | Installer | For | Size |
 | --- | --- | --- |
 | `HPCL-Operator-<version>-x64-setup.exe` | Windows 10 and 11 | about 3 MB; uses the WebView2 already in Windows |
-| `HPCL-Operator-<version>-win7-x64-setup.exe` | Windows 7 SP1, 8 and 8.1 (64-bit) | about 150 MB; WebView2 109 is inside, so no internet is needed to install |
+| `HPCL-Operator-<version>-win7-x64-setup.exe` | Windows 7 SP1, 8 and 8.1, **64-bit** | about 150 MB; WebView2 109 is inside, so no internet is needed to install |
+| `HPCL-Operator-<version>-win7-x86-setup.exe` | Windows 7 SP1, 8 and 8.1, **32-bit** | about 145 MB; same, with the 32-bit app and WebView2 |
 
 The Windows 10/11 installer stops on older Windows with a message pointing to the win7 one. (Microsoft's current WebView2
 setup can't run there; it fails with "PackageIdFromFullName could not be located in KERNEL32.dll".)
 
 How the win7 build differs:
-- **Rust target `x86_64-win7-windows-msvc`** (nightly + `-Zbuild-std`). Normal Rust stopped supporting Windows 7 in 1.78.
+- **Rust target `x86_64-win7-windows-msvc`**, or `i686-win7-windows-msvc` for 32-bit (nightly + `-Zbuild-std`). Normal Rust stopped supporting Windows 7 in 1.78.
 - **C runtime linked into the exe** (`+crt-static`), so it doesn't depend on the Windows 7 Universal CRT update.
 - **A few Windows 8+ imports, delay-loaded.** These come from the WebView2 loader and the `windows` crates: `combase.dll`, `EventSetInformation` and `RoOriginateErrorW`. On Windows 7, `src-tauri/src/win7.rs` uses `ole32.dll` for the first and harmless stand-ins for the other two.
-- **WebView2 109 bundled.** It's the last version that runs on Windows 7/8/8.1 (Chromium 109), set in `src-tauri/tauri.win7.conf.json`.
+- **WebView2 109 bundled.** It's the last version that runs on Windows 7/8/8.1 (Chromium 109), set in `src-tauri/tauri.win7.conf.json` (32-bit: `tauri.win7-x86.conf.json`).
   The UI is built to run on Chromium 109 (`vite.config.ts`: newer CSS colors get plain fallbacks).
 
 **Building it on a Mac:**
@@ -178,13 +179,15 @@ How the win7 build differs:
    rustup toolchain install nightly --component rust-src
    brew install cabextract
    ```
-2. Download `Microsoft.WebView2.FixedVersionRuntime.109.0.1518.78.x64.cab`. Microsoft no longer lists it; a copy is at
+2. Download `Microsoft.WebView2.FixedVersionRuntime.109.0.1518.78.x64.cab` (`.x86.cab` for 32-bit). Microsoft no longer lists it; a copy is at
    github.com/westinyang/WebView2RuntimeArchive (release 109.0.1518.78).
-3. Check that it's Microsoft-signed (`osslsigncode verify`). The SHA-256 of the copy used here is
-   `7622281cf83de1a35e3a471f432f7a897d65f0a7d3975df08512b7b253dd45c7`.
+3. Check that it's Microsoft-signed (`osslsigncode verify`). The SHA-256 of the copies used here:
+   - x64: `7622281cf83de1a35e3a471f432f7a897d65f0a7d3975df08512b7b253dd45c7`
+   - x86: `c507e0df03fe941f6669b74faf713545708653d568d1dce1e683cbe707382253`
 4. Extract it with `cabextract -d src-tauri <cab>` (the folder is git-ignored), then run:
    ```bash
-   scripts/build-win7.sh
+   scripts/build-win7.sh        # 64-bit
+   scripts/build-win7.sh x86    # 32-bit
    ```
 
 Windows 7 itself no longer gets security updates from Microsoft, and WebView2 109 doesn't either. Use it only for this app, and keep the PC's antivirus up to date.
