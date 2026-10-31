@@ -140,7 +140,7 @@ Tests: `cargo test --manifest-path src-tauri/Cargo.toml --lib` (business rules a
 npm install
 npm run app:build
 ```
-The output is `src-tauri\target\release\bundle\nsis\HPCL Operator_1.0.0_x64-setup.exe` (plus an `.msi`).
+The output is `src-tauri\target\release\bundle\nsis\HPCL Operator_<version>_x64-setup.exe` (plus an `.msi`).
 
 **From a Mac** (cross-compile, NSIS installer only):
 ```bash
@@ -149,7 +149,9 @@ rustup target add x86_64-pc-windows-msvc
 cargo install --locked cargo-xwin
 PATH="/opt/homebrew/opt/llvm/bin:$PATH" npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis
 ```
-The output is `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/HPCL Operator_1.0.0_x64-setup.exe`.
+The output is `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/HPCL Operator_<version>_x64-setup.exe`.
+
+**Windows 10 or 11 (64-bit) is required.** Windows 7, 8 and 8.1 can't run it: Microsoft's WebView2 (the app's screen) and current Rust no longer support them. On those versions the installer now stops with a clear message instead of the "PackageIdFromFullName could not be located in KERNEL32.dll" error.
 
 The installer needs Microsoft WebView2. It's built into Windows 10 and 11, and the installer downloads it if it's missing. The app isn't code-signed, so Windows SmartScreen shows "Windows protected your PC" on first install: click **More info → Run anyway**. Signing needs a code-signing certificate.
 
