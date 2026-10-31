@@ -12,6 +12,8 @@ type Props = {
 };
 
 const cn = (n?: string) => (n ? ` #${n}` : "");
+const CONSUMER_NO_DIGITS = 6;
+const OTHER_NOTE_MAX = 60;
 
 function describeAudit(a: AuditEntryDTO) {
   const when = formatDateTime(a.timestamp);
@@ -159,26 +161,34 @@ export function RegisterTable({ rows, editable, title }: Props) {
                       {cashIn ? "CASH IN" : "CASH OUT"}
                     </span>
                   </td>
-                  <td className="tabular px-2 py-2">
+                  <td className="tabular max-w-40 px-2 py-2">
                     {editing && cashIn ? (
                       <input
                         autoFocus
-                        inputMode="numeric"
-                        maxLength={6}
-                        aria-label="Consumer number"
+                        inputMode={r.isOtherProduct ? "text" : "numeric"}
+                        maxLength={r.isOtherProduct ? OTHER_NOTE_MAX : CONSUMER_NO_DIGITS}
+                        aria-label={r.isOtherProduct ? "Note (optional)" : "Consumer number"}
                         value={draftConsumer}
-                        placeholder={r.isOtherProduct ? "Optional" : "6 digits"}
-                        onChange={(e) => setDraftConsumer(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                        placeholder={r.isOtherProduct ? "Optional · any text" : "6 digits"}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setDraftConsumer(r.isOtherProduct ? v.slice(0, OTHER_NOTE_MAX) : v.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
+                        }}
                         onKeyDown={(e) => onEditKeyDown(e, r.id)}
                         className="w-full rounded border border-slate-300 px-2 py-1 outline-none focus:border-hp-blue"
                       />
                     ) : !cashIn ? (
                       <span className="text-slate-300">—</span>
                     ) : (
-                      <span className="flex items-center gap-1.5">
-                        {r.consumerNo && <span className={deleted ? "line-through" : "font-medium text-slate-800"}>{r.consumerNo}</span>}
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        {r.consumerNo && (
+                          <span title={r.consumerNo} className={`truncate ${deleted ? "line-through" : "font-medium text-slate-800"}`}>
+                            {r.consumerNo}
+                          </span>
+                        )}
                         {r.isOtherProduct && (
-                          <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-sky-800">Other</span>
+                          <span className="shrink-0 rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-sky-800">Other</span>
                         )}
                       </span>
                     )}

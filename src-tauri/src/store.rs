@@ -21,6 +21,8 @@ const MAX_PRICE: f64 = 10_000_000.0;
 const CONSUMER_NO_DIGITS: usize = 6;
 const CONSUMER_REQUIRED: &str = "Enter the 6-digit consumer number, or tick “Other product”.";
 const CONSUMER_INVALID: &str = "Consumer number must be exactly 6 digits.";
+/// Other products take free text in the Consumer No box (a name, phone number, note…).
+const OTHER_NOTE_MAX: usize = 60;
 const INVALID_PRICE: &str = "Enter a valid price greater than 0.";
 
 pub fn new_id() -> String {
@@ -62,6 +64,26 @@ fn parse_consumer_no(v: &Value) -> Result<Option<String>, ()> {
         Ok(Some(s))
     } else {
         Err(())
+    }
+}
+
+/// Other products: any text, spaces tidied, capped at OTHER_NOTE_MAX characters. Empty -> Ok(None).
+fn parse_other_note(v: &Value) -> Result<Option<String>, ()> {
+    let s = match v {
+        Value::Null => return Ok(None),
+        Value::String(s) => s.split_whitespace().collect::<Vec<_>>().join(" "),
+        Value::Number(n) => n.to_string(),
+        _ => return Err(()),
+    };
+    Ok((!s.is_empty()).then(|| s.chars().take(OTHER_NOTE_MAX).collect()))
+}
+
+/// What goes in the Consumer No column: 6 digits normally, free text for Other products.
+fn parse_consumer_field(v: &Value, is_other: bool) -> R<Option<String>> {
+    if is_other {
+        parse_other_note(v).map_err(|_| "Enter the note as text.".to_string())
+    } else {
+        parse_consumer_no(v).map_err(|_| CONSUMER_INVALID.to_string())
     }
 }
 
@@ -171,7 +193,7 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     let is_cash_in = kind == "CASH_IN";
     let is_other = is_cash_in && input.is_other_product;
     let consumer_no = if is_cash_in {
-        parse_consumer_no(&input.consumer_no).map_err(|_| CONSUMER_INVALID.to_string())?
+        parse_consumer_field(&input.consumer_no, is_other)?
     } else {
         None
     };
@@ -272,9 +294,10 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
     let price = parse_price(&input.price).ok().flatten().ok_or(INVALID_PRICE)?;
 
     // Consumer number only applies to Cash In; the Other-product flag is fixed at entry time.
+    // Other products keep free text there, which can be added, changed or cleared.
     let mut consumer_no = old.consumer_no.clone();
     if old.kind == "CASH_IN" {
-        let parsed = parse_consumer_no(&input.consumer_no).map_err(|_| CONSUMER_INVALID.to_string())?;
+        let parsed = parse_consumer_field(&input.consumer_no, old.is_other_product)?;
         if parsed.is_none() && !old.is_other_product {
             return Err("Consumer number is required for this entry.".into());
         }
@@ -662,6 +685,21 @@ mod tests {
         )
         .unwrap();
         assert!(other.consumer_no.is_none() && other.is_other_product);
+        let noted = create_transaction(
+            &mut c,
+            serde_json::from_value(json!({"type":"CASH_IN","productName":"Stove","price":900,"isOtherProduct":true,"consumerNo":"  Ramesh   9876 "}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(noted.consumer_no.as_deref(), Some("Ramesh 9876"));
+        // An empty Other entry can get a note when edited, and lose it again.
+        let edit = |c: &mut Connection, note: &str| {
+            update_transaction(c, serde_json::from_value(json!({"id":other.id,"productName":"Stove","price":900,"consumerNo":note})).unwrap())
+        };
+        edit(&mut c, "Paid by Suresh").unwrap();
+        assert_eq!(transactions_for_date(&c, &time::today()).unwrap().iter().find(|t| t.id == other.id).unwrap().consumer_no.as_deref(), Some("Paid by Suresh"));
+        edit(&mut c, "").unwrap();
+        assert!(transactions_for_date(&c, &time::today()).unwrap().iter().find(|t| t.id == other.id).unwrap().consumer_no.is_none());
         let out = create_transaction(
             &mut c,
             serde_json::from_value(json!({"type":"CASH_OUT","productName":"Tea","price":"40","consumerNo":"123456"})).unwrap(),
@@ -669,7 +707,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.consumer_no, None);
         assert_eq!(search_products(&c, "reg").unwrap()[0].name, "regulator");
-        assert_eq!(pending_count(&c).unwrap(), 4 + 3);
+        assert_eq!(pending_count(&c).unwrap(), 5 + 3);
     }
 
     #[test]

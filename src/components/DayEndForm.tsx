@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { Link } from "react-router";
-import { AlertTriangle, Bike, CheckCircle2, Cylinder, Loader2, Lock, Save } from "lucide-react";
+import { AlertTriangle, Bike, Check, CheckCircle2, Cylinder, Loader2, Lock } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatLongDate, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
@@ -12,6 +12,11 @@ type Props = { initial: DayEndDTO; totals: Totals };
 const numberInput =
   "tabular w-full rounded-md border border-slate-300 px-3 py-2 text-right outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50";
 
+/** Wait this long after the last keystroke, then save. */
+const AUTOSAVE_MS = 700;
+
+type SaveBody = { deliveries: DeliveryDTO[]; cylinderStock: CylinderStockDTO };
+
 const toCount = (v: string) => {
   const n = parseInt(v.replace(/\D/g, ""), 10);
   return Number.isFinite(n) ? n : 0;
@@ -20,48 +25,71 @@ const toCount = (v: string) => {
 export function DayEndForm({ initial, totals }: Props) {
   const [deliveries, setDeliveries] = useState<DeliveryDTO[]>(initial.deliveries);
   const [stock, setStock] = useState<CylinderStockDTO>(initial.cylinderStock);
-  const [dirty, setDirty] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "waiting" | "saving" | "saved" | "failed">("idle");
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [pending, startTransition] = useTransition();
   const tableRef = useRef<HTMLTableSectionElement>(null);
 
-  // Warn before leaving with unsaved counts.
+  // ---- Auto-save: every change is saved shortly after the operator stops typing ----
+  const edited = useRef(false); // nothing to save until the operator changes something
+  const unsaved = useRef<SaveBody | null>(null);
+  // Saves run one after another, so an older save can never land after a newer one.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+
+  const flush = useCallback(() => {
+    const body = unsaved.current;
+    if (!body) return queue.current;
+    unsaved.current = null;
+    setSaveState("saving");
+    queue.current = queue.current.then(async () => {
+      const res = await mutate<{ savedAt: string }>("save_day_end", body);
+      if (res.ok) {
+        setSavedAt(res.data.savedAt);
+        setError(null);
+      } else {
+        setError(res.error);
+        unsaved.current ??= body; // retried with the next change or when leaving the page
+      }
+      if (!unsaved.current) setSaveState("saved");
+      else if (!res.ok) setSaveState("failed");
+    });
+    return queue.current;
+  }, []);
+
   useEffect(() => {
-    if (!dirty) return;
+    if (!edited.current || initial.isFinalized) return;
+    unsaved.current = { deliveries, cylinderStock: stock };
+    setSaveState("waiting");
+    const t = setTimeout(flush, AUTOSAVE_MS);
+    return () => clearTimeout(t);
+  }, [deliveries, stock, flush, initial.isFinalized]);
+
+  // Leaving the page (or the day rolling over) saves whatever is still waiting.
+  useEffect(() => () => void flush(), [flush]);
+
+  // Warn before closing while a save is still waiting or failed.
+  const unsafe = saveState === "waiting" || saveState === "saving" || saveState === "failed";
+  useEffect(() => {
+    if (!unsafe) return;
     const handler = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [dirty]);
+  }, [unsafe]);
 
-  const save = () => {
-    startTransition(async () => {
-      const res = await mutate<{ savedAt: string }>("save_day_end", { deliveries, cylinderStock: stock });
-      if (res.ok) {
-        setSavedAt(res.data.savedAt);
-        setDirty(false);
-        setError(null);
-      } else setError(res.error);
-    });
-  };
-
-  // Ctrl/Cmd+S saves progress.
-  const saveRef = useRef(save);
-  useEffect(() => {
-    saveRef.current = save;
-  });
+  // Ctrl/Cmd+S still works: saves right away instead of waiting.
   useEffect(() => {
     if (initial.isFinalized) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        saveRef.current();
+        flush();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [initial.isFinalized]);
+  }, [flush, initial.isFinalized]);
 
   if (initial.isFinalized) {
     return (
@@ -82,8 +110,8 @@ export function DayEndForm({ initial, totals }: Props) {
   }
 
   const updateDelivery = (i: number, patch: Partial<DeliveryDTO>) => {
+    edited.current = true;
     setDeliveries((ds) => ds.map((d, j) => (j === i ? { ...d, ...patch } : d)));
-    setDirty(true);
   };
 
   /** Enter moves down the column, like a spreadsheet. */
@@ -92,19 +120,23 @@ export function DayEndForm({ initial, totals }: Props) {
   };
 
   const updateStock = (key: keyof CylinderStockDTO, field: "full" | "empty", v: string) => {
+    edited.current = true;
     setStock((s) => ({ ...s, [key]: { ...s[key], [field]: toCount(v) } }));
-    setDirty(true);
   };
 
   const doFinalize = () => {
     startTransition(async () => {
+      // Finalize saves these same numbers, so drop the waiting auto-save and let any running one finish.
+      unsaved.current = null;
+      await queue.current;
       const res = await mutate("finalize_day", { deliveries, cylinderStock: stock });
       if (res.ok) {
-        setDirty(false);
         setConfirming(false);
       } else {
         setError(res.error);
         setConfirming(false);
+        unsaved.current = { deliveries, cylinderStock: stock }; // not finalized: still save the numbers
+        flush();
       }
     });
   };
@@ -119,25 +151,7 @@ export function DayEndForm({ initial, totals }: Props) {
           <h1 className="text-xl font-bold text-slate-800">Day End & Stock Reconciliation</h1>
           <p className="text-sm text-slate-500">{formatLongDate(initial.dateString)}</p>
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-slate-500">
-            {dirty ? (
-              <span className="font-medium text-amber-700">Unsaved changes</span>
-            ) : savedAt ? (
-              `Saved at ${formatTime(savedAt)}`
-            ) : null}
-          </span>
-          <button
-            type="button"
-            onClick={save}
-            disabled={pending}
-            title="Save progress (Ctrl+S)"
-            className="flex items-center gap-2 rounded-lg border border-hp-blue bg-white px-4 py-2 font-semibold text-hp-blue hover:bg-blue-50 disabled:opacity-60"
-          >
-            {pending && !confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            Save Progress
-          </button>
-        </div>
+        <SaveStatus state={saveState} savedAt={savedAt} />
       </div>
 
       {error && (
@@ -264,6 +278,22 @@ export function DayEndForm({ initial, totals }: Props) {
         />
       )}
     </div>
+  );
+}
+
+function SaveStatus({ state, savedAt }: { state: "idle" | "waiting" | "saving" | "saved" | "failed"; savedAt: string | null }) {
+  if (state === "idle") return <span className="text-sm text-slate-400">Changes save automatically</span>;
+  if (state === "failed") return <span className="text-sm font-medium text-red-600">Not saved · will retry</span>;
+  if (state === "saved")
+    return (
+      <span className="flex items-center gap-1.5 text-sm text-emerald-700">
+        <Check className="h-4 w-4" /> Saved{savedAt ? ` at ${formatTime(savedAt)}` : ""}
+      </span>
+    );
+  return (
+    <span className="flex items-center gap-1.5 text-sm text-slate-500">
+      <Loader2 className="h-4 w-4 animate-spin" /> Saving…
+    </span>
   );
 }
 

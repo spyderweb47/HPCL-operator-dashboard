@@ -5,6 +5,8 @@ import { formatINR } from "@/lib/format";
 import type { ProductSuggestion as Suggestion, TransactionDTO, TransactionType } from "@/lib/types";
 
 const CONSUMER_NO_DIGITS = 6;
+/** Other products take any text in the Consumer No box (name, phone, note…). */
+const OTHER_NOTE_MAX = 60;
 
 const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
@@ -80,8 +82,8 @@ export function EntryBar() {
 
   /** Problem with the consumer number for the current entry, if any. */
   const consumerProblem = () => {
-    if (!isCashIn) return null;
-    if (!consumerNo) return isOther ? null : CONSUMER_HINT;
+    if (!isCashIn || isOther) return null;
+    if (!consumerNo) return CONSUMER_HINT;
     return consumerNo.length === CONSUMER_NO_DIGITS ? null : `Consumer number must be exactly ${CONSUMER_NO_DIGITS} digits.`;
   };
 
@@ -98,6 +100,8 @@ export function EntryBar() {
   const toggleOther = (next: boolean) => {
     setIsOther(next);
     setError(null);
+    // Back to a normal entry: a typed note can't stay in the 6-digit box.
+    if (!next) setConsumerNo((c) => c.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
     // Ticking it from an empty Consumer No box means "no number" -> go straight to the price.
     if (next && !consumerNo && document.activeElement === consumerRef.current) priceRef.current?.focus();
   };
@@ -177,7 +181,8 @@ export function EntryBar() {
       });
       if (res.ok) {
         const t = res.data;
-        const who = t.type === "CASH_OUT" ? "" : t.consumerNo ? ` · #${t.consumerNo}` : " · Other product";
+        const who =
+          t.type === "CASH_OUT" ? "" : t.isOtherProduct ? ` · Other product${t.consumerNo ? ` · ${t.consumerNo}` : ""}` : ` · #${t.consumerNo}`;
         setFlash(`${t.type === "CASH_IN" ? "Cash In" : "Cash Out"}${who} · ${t.productName} · ${formatINR(t.price)}`);
         resetForNext();
       } else {
@@ -378,7 +383,7 @@ export function EntryBar() {
           )}
         </div>
 
-        {/* Consumer No (Cash In only, exactly 6 digits) */}
+        {/* Consumer No (Cash In only): exactly 6 digits, or any text for Other products */}
         <div className="w-36">
           <label htmlFor="entry-consumer" className="mb-1 block whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
             Consumer No <span className={`text-red-600 ${consumerRequired ? "" : "invisible"}`}>*</span>
@@ -386,21 +391,23 @@ export function EntryBar() {
           <input
             id="entry-consumer"
             ref={consumerRef}
-            inputMode="numeric"
+            inputMode={isOther ? "text" : "numeric"}
             autoComplete="off"
-            maxLength={CONSUMER_NO_DIGITS}
+            maxLength={isOther ? OTHER_NOTE_MAX : CONSUMER_NO_DIGITS}
             disabled={!isCashIn}
             aria-required={consumerRequired}
             value={isCashIn ? consumerNo : ""}
             onChange={(e) => {
-              setConsumerNo(e.target.value.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
+              const v = e.target.value;
+              setConsumerNo(isOther ? v.slice(0, OTHER_NOTE_MAX) : v.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
               setError(null);
             }}
             onKeyDown={onConsumerKeyDown}
             onFocus={(e) => e.target.select()}
-            placeholder={!isCashIn ? "N/A" : isOther ? "Optional" : "6 digits"}
-            className={`tabular w-full rounded-lg border px-3 py-2.5 text-center text-lg tracking-widest outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50 placeholder:tracking-normal ${
-              isCashIn && isOther ? "border-dashed border-slate-300" : "border-slate-300"
+            placeholder={!isCashIn ? "N/A" : isOther ? "Optional · any text" : "6 digits"}
+            title={isCashIn && isOther ? consumerNo : undefined}
+            className={`tabular w-full rounded-lg border px-3 py-2.5 text-center outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50 placeholder:tracking-normal ${
+              isCashIn && isOther ? "border-dashed border-slate-300 text-base placeholder:text-sm" : "border-slate-300 text-lg tracking-widest"
             }`}
           />
         </div>
