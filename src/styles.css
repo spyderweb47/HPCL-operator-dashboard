@@ -22,3 +22,14 @@ body {
 .tabular {
   font-variant-numeric: tabular-nums;
 }
+
+/* Windows 7 runs Chromium 109, which lacks color-mix(): Tailwind's faded placeholder color
+   then falls back to the full text color and looks like a typed value. */
+@layer base {
+  @supports not (color: color-mix(in lab, red, red)) {
+    input::placeholder,
+    textarea::placeholder {
+      color: #94a3b8;
+    }
+  }
+}

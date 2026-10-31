@@ -17,3 +17,5 @@
 # cloud credentials: never commit
 .env*
 src-tauri/cloud.json
+/.webview2-109
+/src-tauri/Microsoft.WebView2.FixedVersionRuntime.*

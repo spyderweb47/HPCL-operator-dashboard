@@ -1,6 +1,6 @@
 [package]
 name = "hpcl-operator"
-version = "1.1.1"
+version = "1.2.0"
 description = "HPCL Dealership Operator: offline-first register with cloud sync"
 edition = "2021"
 default-run = "hpcl-operator"

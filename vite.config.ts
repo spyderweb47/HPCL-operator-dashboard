@@ -16,8 +16,12 @@ export default defineConfig({
     proxy: { "/bridge": "http://127.0.0.1:1430" },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  // Windows 7 runs the last WebView2 that supports it (109, Chromium 109): lightningcss rewrites
+  // newer CSS (oklch colors, color-mix) into what Chromium 109 understands.
+  css: { lightningcss: { targets: { chrome: 109 << 16 } } },
   build: {
-    target: "chrome111", // WebView2 on Windows 10/11 is evergreen Chromium
+    target: "chrome109",
+    cssMinify: "lightningcss",
     sourcemap: false,
   },
 });
