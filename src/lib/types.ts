@@ -13,6 +13,11 @@ export type AuditEntryDTO = {
   newConsumerNo?: string;
   previousPaymentMode?: PaymentMode;
   newPaymentMode?: PaymentMode;
+  previousQuantity?: number;
+  newQuantity?: number;
+  /** Operator name (Settings) and PC that made this change. */
+  user?: string;
+  machineId?: string;
   timestamp: string;
 };
 
@@ -28,6 +33,13 @@ export type TransactionDTO = {
   /** Machine ID of the PC that made the entry, and that PC's name when known. */
   createdBy: string | null;
   createdByName: string | null;
+  /** Operator name (Settings) of whoever made the entry. */
+  createdByUser: string | null;
+  /** The delivery boy the entry is for (null = Office), and his name at the time. */
+  roleId: string | null;
+  roleName: string | null;
+  /** Cylinders, for delivery boy entries. */
+  quantity: number | null;
   status: "ACTIVE" | "EDITED" | "DELETED";
   isDayFinalized: boolean;
   createdAt: string;
@@ -98,6 +110,7 @@ export type OfficePcDTO = {
   deviceName: string;
   appVersion: string | null;
   lastSeenAt: string | null;
+  userName: string | null;
   isThisPc: boolean;
 };
 

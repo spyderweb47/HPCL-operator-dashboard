@@ -1,5 +1,5 @@
-import { useState, type FormEvent, type KeyboardEvent } from "react";
-import { Bike, Check, Copy, Loader2, Monitor, Network, Pencil, Plus, RotateCcw, UserX, X } from "lucide-react";
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
+import { Bike, Check, Copy, Loader2, Monitor, Network, Pencil, Plus, RotateCcw, UserRound, UserX, X } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
@@ -15,11 +15,77 @@ export function SettingsPage() {
         <h1 className="text-xl font-bold text-slate-800">Settings</h1>
         <p className="text-sm text-slate-500">Saved on this PC and synced to the cloud.</p>
       </div>
+      <OperatorName />
       <DeliveryBoysSettings />
       <CloudSettings />
       <OfficePcs />
       <DeviceInfo />
     </div>
+  );
+}
+
+/** A plain name (no password): saved with every entry and change made on this PC, so the cloud shows who did what. */
+function OperatorName() {
+  const { data: saved, error: loadError } = useQuery<string | null>("get_user_name");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (saved !== undefined) setName(saved ?? "");
+  }, [saved]);
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    const res = await mutate<string | null>("set_user_name", { name });
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.error);
+      setFlash(null);
+      return;
+    }
+    setError(null);
+    setName(res.data ?? "");
+    setFlash(res.data ? `Saved. New entries and changes on this PC are marked “${res.data}”.` : "Name removed.");
+  };
+
+  const unchanged = name.trim() === (saved ?? "");
+
+  return (
+    <Card title="Your Name" icon={UserRound}>
+      <form onSubmit={save} className="flex flex-wrap items-center gap-2 px-4 py-3">
+        <input
+          aria-label="Your name"
+          value={name}
+          maxLength={40}
+          onChange={(e) => {
+            setName(e.target.value);
+            setFlash(null);
+          }}
+          placeholder="e.g. Ramesh"
+          className="w-72 rounded-lg border border-slate-300 px-3 py-2 outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20"
+        />
+        <button
+          type="submit"
+          disabled={busy || unchanged}
+          className="flex items-center gap-1.5 rounded-lg bg-hp-blue px-4 py-2 font-semibold text-white hover:bg-hp-blue-dark disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Save
+        </button>
+        {flash && <span className="text-sm text-emerald-700">{flash}</span>}
+        {(error || loadError) && (
+          <span role="alert" className="text-sm text-red-600">
+            {error ?? loadError}
+          </span>
+        )}
+      </form>
+      <p className="border-t border-slate-100 px-4 py-2.5 text-sm text-slate-500">
+        Shown in the cloud with every entry you add, edit or delete on this PC, so it&apos;s clear who made each change. No password
+        needed.
+      </p>
+    </Card>
   );
 }
 
@@ -239,8 +305,8 @@ function SmallButton(props: { label: string; text?: string; onClick: () => void;
   );
 }
 
-/** Sharing between PCs needs v1.5.0 or newer on every PC. */
-const SHARING_SINCE = [1, 5, 0];
+/** Every PC should run v1.6.0 or newer: older ones don't show roles or quantities (and v1.4 and older don't share at all). */
+const SHARING_SINCE = [1, 6, 0];
 const tooOld = (v: string | null) => {
   if (!v) return true;
   const parts = v.split(".").map((n) => parseInt(n, 10) || 0);
@@ -267,6 +333,7 @@ function OfficePcs() {
             <li key={pc.machineId} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5">
               <Monitor className="h-4 w-4 text-slate-400" />
               <span className="font-medium text-slate-800">{pc.deviceName}</span>
+              {pc.userName && <span className="text-slate-600">· {pc.userName}</span>}
               {pc.isThisPc && <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold uppercase text-hp-blue">This PC</span>}
               <code className="font-mono text-xs text-slate-400">{pc.machineId}</code>
               <span className="ml-auto text-slate-500">
@@ -275,7 +342,7 @@ function OfficePcs() {
               </span>
               {!pc.isThisPc && tooOld(pc.appVersion) && (
                 <span className="w-full pl-7 text-xs font-medium text-amber-700">
-                  Update this PC to version 1.5 or newer, or it won&apos;t receive the other PCs&apos; entries.
+                  Update this PC to version 1.6 or newer. Older versions don&apos;t show delivery boy roles and quantities.
                 </span>
               )}
             </li>

@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
-import { Link } from "react-router";
-import { AlertTriangle, Bike, Check, CheckCircle2, Cylinder, Loader2, Lock } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, Cylinder, Loader2, Lock } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatLongDate, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
 import { PAYMENT_LABEL } from "@/lib/payment";
-import type { CylinderStockDTO, DayEndDTO, DeliveryDTO, Totals } from "@/lib/types";
-import { Card, DeliveriesView, STOCK_ROWS, StockView } from "./DayEndViews";
+import type { CylinderStockDTO, DayEndDTO, Totals } from "@/lib/types";
+import { Card, STOCK_ROWS, StockView } from "./DayEndViews";
 
 type Props = { initial: DayEndDTO; totals: Totals };
 
@@ -16,7 +15,8 @@ const numberInput =
 /** Wait this long after the last keystroke, then save. */
 const AUTOSAVE_MS = 700;
 
-type SaveBody = { deliveries: DeliveryDTO[]; cylinderStock: CylinderStockDTO };
+// Only the stock count: delivery counts saved by older versions are left as they are.
+type SaveBody = { cylinderStock: CylinderStockDTO };
 
 const toCount = (v: string) => {
   const n = parseInt(v.replace(/\D/g, ""), 10);
@@ -24,14 +24,12 @@ const toCount = (v: string) => {
 };
 
 export function DayEndForm({ initial, totals }: Props) {
-  const [deliveries, setDeliveries] = useState<DeliveryDTO[]>(initial.deliveries);
   const [stock, setStock] = useState<CylinderStockDTO>(initial.cylinderStock);
   const [saveState, setSaveState] = useState<"idle" | "waiting" | "saving" | "saved" | "failed">("idle");
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [pending, startTransition] = useTransition();
-  const tableRef = useRef<HTMLTableSectionElement>(null);
 
   // ---- Auto-save: every change is saved shortly after the operator stops typing ----
   const edited = useRef(false); // nothing to save until the operator changes something
@@ -41,7 +39,7 @@ export function DayEndForm({ initial, totals }: Props) {
   const saving = useRef(0);
   // The counts as last loaded or saved. Each save sends them along, so only the cells typed
   // here are written and counts typed on another PC of the office meanwhile are kept.
-  const baseline = useRef<SaveBody>({ deliveries: initial.deliveries, cylinderStock: initial.cylinderStock });
+  const baseline = useRef<SaveBody>({ cylinderStock: initial.cylinderStock });
   const adopting = useRef(false);
 
   const flush = useCallback(() => {
@@ -71,11 +69,10 @@ export function DayEndForm({ initial, totals }: Props) {
   // (then they show after the save, which keeps both).
   useEffect(() => {
     if (unsaved.current || saving.current > 0) return;
-    const server = { deliveries: initial.deliveries, cylinderStock: initial.cylinderStock };
+    const server = { cylinderStock: initial.cylinderStock };
     baseline.current = server;
-    if (JSON.stringify(server) === JSON.stringify({ deliveries, cylinderStock: stock })) return;
+    if (JSON.stringify(server.cylinderStock) === JSON.stringify(stock)) return;
     adopting.current = true; // not the operator's typing: nothing to save
-    setDeliveries(server.deliveries);
     setStock(server.cylinderStock);
     // Only when new data arrives, not on every keystroke.
   }, [initial]);
@@ -86,11 +83,11 @@ export function DayEndForm({ initial, totals }: Props) {
       return;
     }
     if (!edited.current || initial.isFinalized) return;
-    unsaved.current = { deliveries, cylinderStock: stock };
+    unsaved.current = { cylinderStock: stock };
     setSaveState("waiting");
     const t = setTimeout(flush, AUTOSAVE_MS);
     return () => clearTimeout(t);
-  }, [deliveries, stock, flush, initial.isFinalized]);
+  }, [stock, flush, initial.isFinalized]);
 
   // Leaving the page (or the day rolling over) saves whatever is still waiting.
   useEffect(() => () => void flush(), [flush]);
@@ -127,23 +124,10 @@ export function DayEndForm({ initial, totals }: Props) {
             {initial.finalizedAt ? ` at ${formatDateTime(initial.finalizedAt)}` : ""}. All entries are locked.
           </p>
         </div>
-        <div className="grid gap-4 lg:grid-cols-2">
-          <DeliveriesView deliveries={initial.deliveries} />
-          <StockView stock={initial.cylinderStock} />
-        </div>
+        <StockView stock={initial.cylinderStock} />
       </div>
     );
   }
-
-  const updateDelivery = (i: number, patch: Partial<DeliveryDTO>) => {
-    edited.current = true;
-    setDeliveries((ds) => ds.map((d, j) => (j === i ? { ...d, ...patch } : d)));
-  };
-
-  /** Enter moves down the column, like a spreadsheet. */
-  const focusNextRow = (i: number, col: "bills" | "cyl") => {
-    tableRef.current?.querySelector<HTMLInputElement>(`input[data-row="${i + 1}"][data-col="${col}"]`)?.focus();
-  };
 
   const updateStock = (key: keyof CylinderStockDTO, field: "full" | "empty", v: string) => {
     edited.current = true;
@@ -155,20 +139,18 @@ export function DayEndForm({ initial, totals }: Props) {
       // Finalize saves these same numbers, so drop the waiting auto-save and let any running one finish.
       unsaved.current = null;
       await queue.current;
-      const res = await mutate("finalize_day", { deliveries, cylinderStock: stock, base: baseline.current });
+      const res = await mutate("finalize_day", { cylinderStock: stock, base: baseline.current });
       if (res.ok) {
         setConfirming(false);
       } else {
         setError(res.error);
         setConfirming(false);
-        unsaved.current = { deliveries, cylinderStock: stock }; // not finalized: still save the numbers
+        unsaved.current = { cylinderStock: stock }; // not finalized: still save the numbers
         flush();
       }
     });
   };
 
-  const totalBills = deliveries.reduce((s, d) => s + d.billsPrinted, 0);
-  const totalCyl = deliveries.reduce((s, d) => s + d.cylindersDelivered, 0);
 
   return (
     <div className="space-y-4">
@@ -185,72 +167,6 @@ export function DayEndForm({ initial, totals }: Props) {
           {error}
         </p>
       )}
-
-      <Card
-        title="Delivery Boy Tracker"
-        icon={Bike}
-        aside={
-          <span className="tabular text-sm text-slate-500">
-            Bills {totalBills} · Delivered {totalCyl}
-          </span>
-        }
-      >
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-            <tr>
-              <th className="px-4 py-2">Delivery Boy</th>
-              <th className="w-44 px-2 py-2 text-right">Bills Printed</th>
-              <th className="w-44 px-4 py-2 text-right">Cylinders Delivered</th>
-            </tr>
-          </thead>
-          <tbody ref={tableRef} className="divide-y divide-slate-100">
-            {deliveries.length === 0 && (
-              <tr>
-                <td colSpan={3} className="px-4 py-6 text-center text-slate-400">
-                  No delivery boys yet.{" "}
-                  <Link to="/settings" className="font-medium text-hp-blue underline">
-                    Add them in Settings
-                  </Link>
-                  .
-                </td>
-              </tr>
-            )}
-            {deliveries.map((d, i) => (
-              <tr key={d.deliveryBoyId}>
-                <td className="px-4 py-2 font-medium text-slate-800">{d.deliveryBoyName}</td>
-                <td className="px-2 py-2">
-                  <input
-                    inputMode="numeric"
-                    aria-label={`Bills printed by ${d.deliveryBoyName}`}
-                    data-row={i}
-                    data-col="bills"
-                    value={d.billsPrinted || ""}
-                    placeholder="0"
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => updateDelivery(i, { billsPrinted: toCount(e.target.value) })}
-                    onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), focusNextRow(i, "bills"))}
-                    className={numberInput}
-                  />
-                </td>
-                <td className="px-4 py-2">
-                  <input
-                    inputMode="numeric"
-                    aria-label={`Cylinders delivered by ${d.deliveryBoyName}`}
-                    data-row={i}
-                    data-col="cyl"
-                    value={d.cylindersDelivered || ""}
-                    placeholder="0"
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => updateDelivery(i, { cylindersDelivered: toCount(e.target.value) })}
-                    onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), focusNextRow(i, "cyl"))}
-                    className={numberInput}
-                  />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Card>
 
       <Card title="Cylinder Stock Count" icon={Cylinder}>
         <div className="grid gap-4 p-4 md:grid-cols-3">
@@ -295,9 +211,6 @@ export function DayEndForm({ initial, totals }: Props) {
         <ConfirmFinalize
           date={initial.dateString}
           totals={totals}
-          deliveries={deliveries.filter((d) => d.billsPrinted || d.cylindersDelivered).length}
-          totalBills={totalBills}
-          totalCyl={totalCyl}
           pending={pending}
           onCancel={() => setConfirming(false)}
           onConfirm={doFinalize}
@@ -326,9 +239,6 @@ function SaveStatus({ state, savedAt }: { state: "idle" | "waiting" | "saving" |
 function ConfirmFinalize(props: {
   date: string;
   totals: Totals;
-  deliveries: number;
-  totalBills: number;
-  totalCyl: number;
   pending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -351,8 +261,6 @@ function ConfirmFinalize(props: {
       .filter((m) => t.inByMode[m] || t.outByMode[m])
       .map((m) => [`${PAYMENT_LABEL[m]} (in − out)`, formatINR(received(m))]),
     ["Active entries", String(t.count)],
-    ["Delivery boys with counts", String(props.deliveries)],
-    ["Bills printed / Delivered", `${props.totalBills} / ${props.totalCyl}`],
   ];
 
   return (

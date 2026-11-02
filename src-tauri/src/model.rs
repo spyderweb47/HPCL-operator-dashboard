@@ -22,6 +22,16 @@ pub struct AuditEntry {
     pub previous_payment_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_payment_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_quantity: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_quantity: Option<i64>,
+    /// The operator's name from Settings on the PC that made this change (if set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The PC that made this change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     pub timestamp: String,
 }
 
@@ -42,6 +52,15 @@ pub struct TransactionDTO {
     pub created_by: Option<String>,
     /// That PC's name, when known.
     pub created_by_name: Option<String>,
+    /// The operator's name (Settings) who made the entry / changed it last.
+    pub created_by_user: Option<String>,
+    #[serde(skip_serializing)]
+    pub updated_by_user: Option<String>,
+    /// The delivery boy the entry is for (None = Office), and his name at the time.
+    pub role_id: Option<String>,
+    pub role_name: Option<String>,
+    /// Cylinders, for delivery boy entries.
+    pub quantity: Option<i64>,
     pub status: String,
     pub is_day_finalized: bool,
     pub created_at: String,
@@ -156,5 +175,6 @@ pub struct OfficePcDTO {
     pub device_name: String,
     pub app_version: Option<String>,
     pub last_seen_at: Option<String>,
+    pub user_name: Option<String>,
     pub is_this_pc: bool,
 }

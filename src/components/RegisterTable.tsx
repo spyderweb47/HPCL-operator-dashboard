@@ -1,5 +1,5 @@
 import { useState, useTransition, type KeyboardEvent } from "react";
-import { Check, CloudUpload, Eye, EyeOff, Loader2, Pencil, Trash2, X } from "lucide-react";
+import { Bike, Check, CloudUpload, Eye, EyeOff, Loader2, Pencil, Trash2, X } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
@@ -14,19 +14,22 @@ type Props = {
 
 const cn = (n?: string) => (n ? ` #${n}` : "");
 const paid = (m?: PaymentMode) => (m && m !== "CASH" ? ` · ${PAYMENT_LABEL[m]}` : "");
+const qty = (n?: number) => (n ? ` · Qty ${n}` : "");
 const CONSUMER_NO_DIGITS = 6;
 const OTHER_NOTE_MAX = 60;
+const QUANTITY_DIGITS = 4;
 
 function describeAudit(a: AuditEntryDTO) {
   const when = formatDateTime(a.timestamp);
   // Payment type is shown when it isn't cash, and on both sides whenever an edit changed it.
   const modeChanged = a.previousPaymentMode && a.newPaymentMode && a.previousPaymentMode !== a.newPaymentMode;
   const pm = (m?: PaymentMode) => (modeChanged ? ` · ${PAYMENT_LABEL[m ?? "CASH"]}` : paid(m));
-  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}${pm(a.previousPaymentMode)}`;
-  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}${pm(a.newPaymentMode)}`;
-  if (a.action === "CREATED") return `${when} · Created: ${next}`;
-  if (a.action === "DELETED") return `${when} · Deleted (was ${prev})`;
-  return `${when} · Edited: ${prev} → ${next}`;
+  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}${qty(a.previousQuantity)}${pm(a.previousPaymentMode)}`;
+  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}${qty(a.newQuantity)}${pm(a.newPaymentMode)}`;
+  const by = a.user ? ` · by ${a.user}` : "";
+  if (a.action === "CREATED") return `${when} · Created: ${next}${by}`;
+  if (a.action === "DELETED") return `${when} · Deleted (was ${prev})${by}`;
+  return `${when} · Edited: ${prev} → ${next}${by}`;
 }
 
 export function RegisterTable({ rows, editable, title }: Props) {
@@ -41,15 +44,16 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const [, startTransition] = useTransition();
 
   const deletedCount = rows.filter((r) => r.status === "DELETED").length;
-  // Entries from more than one PC of the office: show which PC made each one.
-  const severalPcs = new Set(rows.map((r) => r.createdBy)).size > 1;
+  // Entries from more than one operator or PC of the office: show who made each one.
+  const who = (r: TransactionDTO) => r.createdByUser ?? r.createdByName;
+  const severalPcs = new Set(rows.map((r) => r.createdByUser ?? r.createdBy)).size > 1;
   const visible = showDeleted ? rows : rows.filter((r) => r.status !== "DELETED");
 
   const startEdit = (r: TransactionDTO) => {
     setEditingId(r.id);
     setDraftName(r.productName);
     setDraftPrice(String(r.price));
-    setDraftConsumer(r.consumerNo ?? "");
+    setDraftConsumer(r.roleId ? String(r.quantity ?? "") : (r.consumerNo ?? ""));
     setDraftPayment(r.paymentMode ?? "CASH");
     setError(null);
   };
@@ -59,14 +63,16 @@ export function RegisterTable({ rows, editable, title }: Props) {
     setError(null);
   };
 
-  const saveEdit = (id: string) => {
+  const saveEdit = (r: TransactionDTO) => {
+    const id = r.id;
     setBusyId(id);
     startTransition(async () => {
+      // Delivery boy entries edit the quantity in the box where others edit the consumer number.
       const res = await mutate("update_transaction", {
         id,
         productName: draftName,
         price: draftPrice,
-        consumerNo: draftConsumer,
+        ...(r.roleId ? { quantity: draftConsumer || null } : { consumerNo: draftConsumer }),
         paymentMode: draftPayment,
       });
       setBusyId(null);
@@ -88,10 +94,10 @@ export function RegisterTable({ rows, editable, title }: Props) {
     });
   };
 
-  const onEditKeyDown = (e: KeyboardEvent<HTMLElement>, id: string) => {
+  const onEditKeyDown = (e: KeyboardEvent<HTMLElement>, r: TransactionDTO) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      saveEdit(id);
+      saveEdit(r);
     } else if (e.key === "Escape") {
       e.preventDefault();
       cancelEdit();
@@ -129,7 +135,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
               <th className="w-12 px-4 py-2">#</th>
               <th className="w-24 px-2 py-2">Time</th>
               <th className="w-36 px-2 py-2">Type</th>
-              <th className="w-32 px-2 py-2">Consumer No</th>
+              <th className="w-32 px-2 py-2">Consumer / Qty</th>
               <th className="px-2 py-2">Product / Item</th>
               <th className="w-36 px-2 py-2 text-right">Amount</th>
               {editable && <th className="w-28 px-4 py-2 text-right">Actions</th>}
@@ -167,8 +173,11 @@ export function RegisterTable({ rows, editable, title }: Props) {
                       )}
                     </span>
                     {severalPcs && (
-                      <span title={`Entered on ${r.createdByName ?? "another PC"}`} className="block max-w-24 truncate text-[10px] text-slate-400">
-                        {r.createdByName ?? "Other PC"}
+                      <span
+                        title={`Entered${r.createdByUser ? ` by ${r.createdByUser}` : ""} on ${r.createdByName ?? "another PC"}`}
+                        className="block max-w-24 truncate text-[10px] text-slate-400"
+                      >
+                        {who(r) ?? "Other PC"}
                       </span>
                     )}
                   </td>
@@ -185,7 +194,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         aria-label="Payment"
                         value={draftPayment}
                         onChange={(e) => setDraftPayment(e.target.value as PaymentMode)}
-                        onKeyDown={(e) => onEditKeyDown(e, r.id)}
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
                         className="mt-1 block w-full rounded border border-slate-300 bg-white px-1 py-0.5 text-xs outline-none focus:border-hp-blue"
                       >
                         {PAYMENT_MODES.map((m) => (
@@ -207,9 +216,28 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         </span>
                       )
                     )}
+                    {r.roleName && (
+                      <span title={`Entry for delivery boy ${r.roleName}`} className="mt-0.5 flex max-w-36 items-center gap-1 text-[11px] font-medium text-amber-800">
+                        <Bike className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{r.roleName}</span>
+                      </span>
+                    )}
                   </td>
                   <td className="tabular max-w-40 px-2 py-2">
-                    {editing && cashIn ? (
+                    {editing && cashIn && r.roleId ? (
+                      <input
+                        autoFocus
+                        inputMode="numeric"
+                        maxLength={QUANTITY_DIGITS}
+                        aria-label="Quantity"
+                        value={draftConsumer}
+                        placeholder={r.isOtherProduct ? "Optional" : "Qty"}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => setDraftConsumer(e.target.value.replace(/\D/g, "").slice(0, QUANTITY_DIGITS))}
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
+                        className="w-full rounded border border-slate-300 px-2 py-1 outline-none focus:border-hp-blue"
+                      />
+                    ) : editing && cashIn ? (
                       <input
                         autoFocus
                         inputMode={r.isOtherProduct ? "text" : "numeric"}
@@ -222,13 +250,16 @@ export function RegisterTable({ rows, editable, title }: Props) {
                           const v = e.target.value;
                           setDraftConsumer(r.isOtherProduct ? v.slice(0, OTHER_NOTE_MAX) : v.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
                         }}
-                        onKeyDown={(e) => onEditKeyDown(e, r.id)}
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
                         className="w-full rounded border border-slate-300 px-2 py-1 outline-none focus:border-hp-blue"
                       />
                     ) : !cashIn ? (
                       <span className="text-slate-300">—</span>
                     ) : (
                       <span className="flex min-w-0 items-center gap-1.5">
+                        {r.quantity != null && (
+                          <span className={deleted ? "line-through" : "font-medium text-slate-800"}>Qty {r.quantity}</span>
+                        )}
                         {r.consumerNo && (
                           <span title={r.consumerNo} className={`truncate ${deleted ? "line-through" : "font-medium text-slate-800"}`}>
                             {r.consumerNo}
@@ -246,7 +277,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         autoFocus={!cashIn}
                         value={draftName}
                         onChange={(e) => setDraftName(e.target.value)}
-                        onKeyDown={(e) => onEditKeyDown(e, r.id)}
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
                         className="w-full rounded border border-slate-300 px-2 py-1 outline-none focus:border-hp-blue"
                       />
                     ) : (
@@ -271,7 +302,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         inputMode="decimal"
                         value={draftPrice}
                         onChange={(e) => setDraftPrice(e.target.value.replace(/[^\d.]/g, ""))}
-                        onKeyDown={(e) => onEditKeyDown(e, r.id)}
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
                         className="w-28 rounded border border-slate-300 px-2 py-1 text-right outline-none focus:border-hp-blue"
                       />
                     ) : (
@@ -287,7 +318,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
                           <Loader2 className="h-4 w-4 animate-spin text-slate-400" />
                         ) : editing ? (
                           <>
-                            <IconButton label="Save (Enter)" onClick={() => saveEdit(r.id)} className="text-emerald-700 hover:bg-emerald-50">
+                            <IconButton label="Save (Enter)" onClick={() => saveEdit(r)} className="text-emerald-700 hover:bg-emerald-50">
                               <Check className="h-4 w-4" />
                             </IconButton>
                             <IconButton label="Cancel (Esc)" onClick={cancelEdit} className="text-slate-600 hover:bg-slate-100">

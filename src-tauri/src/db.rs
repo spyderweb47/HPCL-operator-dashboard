@@ -103,6 +103,19 @@ CREATE TABLE machines (
   app_version  TEXT,
   last_seen_at TEXT
 );
+"#, r#"
+-- v1.6: who made each entry, and entries made for a delivery boy.
+
+-- The delivery boy the entry is for (NULL = Office), with his name as it was then.
+ALTER TABLE transactions ADD COLUMN role_id TEXT;
+ALTER TABLE transactions ADD COLUMN role_name TEXT;
+-- Delivery boy entries count cylinders instead of taking a consumer number.
+ALTER TABLE transactions ADD COLUMN quantity INTEGER;
+-- The operator's name from Settings (NULL = not set), when the entry was made / last changed.
+ALTER TABLE transactions ADD COLUMN created_by_user TEXT;
+ALTER TABLE transactions ADD COLUMN updated_by_user TEXT;
+
+ALTER TABLE machines ADD COLUMN user_name TEXT;
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

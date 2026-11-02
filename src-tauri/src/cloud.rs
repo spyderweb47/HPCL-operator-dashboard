@@ -334,7 +334,7 @@ async fn ensure_indexes(db: &Database) -> mongodb::error::Result<()> {
 }
 
 async fn heartbeat(core: &Core, db: &Database) -> Result<(), SyncError> {
-    let pending = core.with_db(|c| store::pending_count(c))?;
+    let (pending, user) = core.with_db(|c| Ok((store::pending_count(c)?, store::user_name(c)?)))?;
     let now = BsonDate::now();
     let info = &core.info;
     db.collection::<Document>(MACHINES)
@@ -343,6 +343,8 @@ async fn heartbeat(core: &Core, db: &Database) -> Result<(), SyncError> {
             doc! {
                 "$set": {
                     "deviceName": &info.device_name,
+                    // The operator's name from Settings (null = not set).
+                    "userName": opt_str(&user),
                     "os": std::env::consts::OS,
                     "appVersion": &info.app_version,
                     "retentionDays": info.retention_days,
@@ -356,7 +358,7 @@ async fn heartbeat(core: &Core, db: &Database) -> Result<(), SyncError> {
         .await?;
     core.with_db(|c| {
         let tx = c.transaction().map_err(db_err)?;
-        store::apply_remote_machine(&tx, &info.machine_id, &info.device_name, Some(&info.app_version), Some(&time::now_iso()))?;
+        store::touch_this_pc(&tx, info)?;
         tx.commit().map_err(db_err)
     })?;
     Ok(())
@@ -409,6 +411,14 @@ fn audit_doc(a: &AuditEntry) -> Document {
     put_s("newConsumerNo", &a.new_consumer_no);
     put_s("previousPaymentMode", &a.previous_payment_mode);
     put_s("newPaymentMode", &a.new_payment_mode);
+    put_s("user", &a.user);
+    put_s("machineId", &a.machine_id);
+    if let Some(q) = a.previous_quantity {
+        d.insert("previousQuantity", q);
+    }
+    if let Some(q) = a.new_quantity {
+        d.insert("newQuantity", q);
+    }
     if let Some(p) = a.previous_price {
         d.insert("previousPrice", p);
     }
@@ -531,7 +541,8 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT id, date_string, type, product_name, price, consumer_no, is_other_product, status, is_day_finalized,
-                    audit_log, created_at, updated_at, version, payment_mode, created_by
+                    audit_log, created_at, updated_at, version, payment_mode, created_by,
+                    role_id, role_name, quantity, created_by_user, updated_by_user
              FROM transactions WHERE version > synced_version ORDER BY created_at LIMIT ?1",
         )
         .map_err(db_err)?;
@@ -548,6 +559,9 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     // The PC that made the entry; `updatedBy` is the PC that changed it last.
                     "machineId": r.get::<_, Option<String>>(14)?.unwrap_or_else(|| machine_id.to_string()),
                     "updatedBy": machine_id,
+                    // Operator names from Settings: who made the entry, and who changed it last.
+                    "createdByUser": opt_str(&r.get(18)?),
+                    "updatedByUser": opt_str(&r.get(19)?),
                     "dateString": r.get::<_, String>(1)?,
                     "type": r.get::<_, String>(2)?,
                     "productName": r.get::<_, String>(3)?,
@@ -555,6 +569,10 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "consumerNo": opt_str(&r.get(5)?),
                     "isOtherProduct": r.get::<_, bool>(6)?,
                     "paymentMode": r.get::<_, String>(13)?,
+                    // The delivery boy the entry is for (null = Office), and his cylinder count.
+                    "roleId": opt_str(&r.get(15)?),
+                    "roleName": opt_str(&r.get(16)?),
+                    "quantity": r.get::<_, Option<i64>>(17)?.map(Bson::Int64).unwrap_or(Bson::Null),
                     "status": r.get::<_, String>(7)?,
                     "isDayFinalized": r.get::<_, bool>(8)?,
                     "auditLog": audit.iter().map(audit_doc).collect::<Vec<_>>(),
@@ -681,6 +699,10 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
                     new_consumer_no: opt_s(e, "newConsumerNo"),
                     previous_payment_mode: opt_s(e, "previousPaymentMode"),
                     new_payment_mode: opt_s(e, "newPaymentMode"),
+                    previous_quantity: e.contains_key("previousQuantity").then(|| num(e, "previousQuantity") as i64),
+                    new_quantity: e.contains_key("newQuantity").then(|| num(e, "newQuantity") as i64),
+                    user: opt_s(e, "user"),
+                    machine_id: opt_s(e, "machineId"),
                     timestamp: iso(e, "timestamp").unwrap_or_default(),
                 })
                 .collect()
@@ -696,6 +718,11 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
         is_other_product: flag(d, "isOtherProduct"),
         created_by: opt_s(d, "machineId"),
         created_by_name: None,
+        created_by_user: opt_s(d, "createdByUser"),
+        updated_by_user: opt_s(d, "updatedByUser"),
+        role_id: opt_s(d, "roleId"),
+        role_name: opt_s(d, "roleName"),
+        quantity: matches!(d.get("quantity"), Some(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))).then(|| num(d, "quantity") as i64),
         // Entries uploaded before payment types existed were all cash.
         payment_mode: opt_s(d, "paymentMode")
             .filter(|m| store::PAYMENT_MODES.contains(&m.as_str()))
@@ -862,8 +889,17 @@ async fn pull_machines(core: &Core, db: &Database) -> Result<(), SyncError> {
         let tx = c.transaction().map_err(db_err)?;
         for d in &docs {
             let id = doc_id(d, "_id");
-            let last_seen = iso(d, "lastSeenAt");
-            store::apply_remote_machine(&tx, &id, &s(d, "deviceName"), opt_s(d, "appVersion").as_deref(), last_seen.as_deref())?;
+            let (name, version, last_seen, user) = (s(d, "deviceName"), opt_s(d, "appVersion"), iso(d, "lastSeenAt"), opt_s(d, "userName"));
+            store::apply_remote_machine(
+                &tx,
+                &store::MachineInfo {
+                    id: &id,
+                    device_name: &name,
+                    app_version: version.as_deref(),
+                    last_seen_at: last_seen.as_deref(),
+                    user_name: user.as_deref(),
+                },
+            )?;
         }
         tx.commit().map_err(db_err)
     })?;

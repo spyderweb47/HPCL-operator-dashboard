@@ -24,6 +24,10 @@ const CONSUMER_INVALID: &str = "Consumer number must be exactly 6 digits.";
 /// Other products take free text in the Consumer No box (a name, phone number, note…).
 const OTHER_NOTE_MAX: usize = 60;
 const INVALID_PRICE: &str = "Enter a valid price greater than 0.";
+const QUANTITY_MAX: i64 = 9999;
+const QUANTITY_REQUIRED: &str = "Enter the quantity, or tick “Other product”.";
+const QUANTITY_INVALID: &str = "Quantity must be a whole number from 1 to 9999.";
+const USER_NAME_MAX: usize = 40;
 
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -95,6 +99,46 @@ fn parse_payment_mode(v: Option<&str>) -> R<&'static str> {
     PAYMENT_MODES.into_iter().find(|m| m.eq_ignore_ascii_case(v)).ok_or_else(|| format!("Unknown payment type \"{v}\"."))
 }
 
+/// Delivery boy entries: a whole number from 1 to QUANTITY_MAX. Empty -> Ok(None).
+fn parse_quantity(v: &Value) -> R<Option<i64>> {
+    let n = match v {
+        Value::Null => return Ok(None),
+        Value::String(s) if s.trim().is_empty() => return Ok(None),
+        Value::String(s) => s.trim().parse::<i64>().map_err(|_| QUANTITY_INVALID.to_string())?,
+        Value::Number(n) => n.as_i64().ok_or(QUANTITY_INVALID)?,
+        _ => return Err(QUANTITY_INVALID.into()),
+    };
+    if (1..=QUANTITY_MAX).contains(&n) {
+        Ok(Some(n))
+    } else {
+        Err(QUANTITY_INVALID.into())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The operator's name (Settings): recorded on every entry and change, so the cloud shows who did what
+// ---------------------------------------------------------------------------------------------
+
+pub fn user_name(conn: &Connection) -> R<Option<String>> {
+    crate::db::meta_get(conn, "user_name").map_err(db_err)
+}
+
+/// Empty clears it.
+pub fn set_user_name(conn: &Connection, raw: &str) -> R<Option<String>> {
+    let name: String = clean_name(raw).chars().take(USER_NAME_MAX).collect::<String>().trim_end().to_string();
+    if name.is_empty() {
+        conn.execute("DELETE FROM meta WHERE key = 'user_name'", []).map_err(db_err)?;
+        return Ok(None);
+    }
+    crate::db::meta_set(conn, "user_name", &name).map_err(db_err)?;
+    Ok(Some(name))
+}
+
+/// Who is making a change on this PC, for the audit trail.
+fn author(conn: &Connection) -> R<(Option<String>, Option<String>)> {
+    Ok((user_name(conn)?, crate::db::meta_get(conn, "machine_id").map_err(db_err)?))
+}
+
 /// A non-negative whole count, capped.
 fn count(v: &Value) -> i64 {
     let n = match v {
@@ -118,7 +162,8 @@ const TX_COLS: &str = "id, date_string, type, product_name, price, consumer_no, 
                        is_day_finalized, created_at, audit_log, version, synced_version, payment_mode, \
                        COALESCE(created_by, (SELECT value FROM meta WHERE key = 'machine_id')), \
                        (SELECT device_name FROM machines \
-                         WHERE machines.id = COALESCE(transactions.created_by, (SELECT value FROM meta WHERE key = 'machine_id')))";
+                         WHERE machines.id = COALESCE(transactions.created_by, (SELECT value FROM meta WHERE key = 'machine_id'))), \
+                       created_by_user, updated_by_user, role_id, role_name, quantity";
 
 fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
     let audit: String = r.get(10)?;
@@ -135,6 +180,11 @@ fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
         payment_mode: r.get(13)?,
         created_by: r.get(14)?,
         created_by_name: r.get(15)?,
+        created_by_user: r.get(16)?,
+        updated_by_user: r.get(17)?,
+        role_id: r.get(18)?,
+        role_name: r.get(19)?,
+        quantity: r.get(20)?,
         status: r.get(7)?,
         is_day_finalized: r.get(8)?,
         created_at: r.get(9)?,
@@ -198,6 +248,22 @@ pub struct CreateTxInput {
     /// "CASH" (default) | "ONLINE" | "SYSTEM"
     #[serde(default)]
     pub payment_mode: Option<String>,
+    /// A delivery boy's ID; absent/empty = Office.
+    #[serde(default)]
+    pub role_id: Option<String>,
+    /// Delivery boy Cash In entries: required unless Other product.
+    #[serde(default)]
+    pub quantity: Value,
+}
+
+/// The delivery boy an entry is made for: must be on the active list. None = Office.
+fn resolve_role(conn: &Connection, id: Option<&str>) -> R<Option<(String, String)>> {
+    let Some(id) = id.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+    conn.query_row("SELECT id, name FROM delivery_boys WHERE id = ?1 AND is_active = 1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| "This delivery boy is no longer on the list. Choose another role.".to_string())
+        .map(Some)
 }
 
 pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<TransactionDTO> {
@@ -209,16 +275,29 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     let mut price = parse_price(&input.price).map_err(|_| INVALID_PRICE.to_string())?;
     let payment_mode = parse_payment_mode(input.payment_mode.as_deref())?;
 
+    let role = resolve_role(conn, input.role_id.as_deref())?;
     let is_cash_in = kind == "CASH_IN";
     let is_other = is_cash_in && input.is_other_product;
-    let consumer_no = if is_cash_in {
-        parse_consumer_field(&input.consumer_no, is_other)?
-    } else {
-        None
+    // Office Cash In takes a consumer number; a delivery boy's Cash In takes a quantity instead.
+    let (consumer_no, quantity) = match (is_cash_in, &role) {
+        (false, _) => (None, None),
+        (true, None) => {
+            let c = parse_consumer_field(&input.consumer_no, is_other)?;
+            if !is_other && c.is_none() {
+                return Err(CONSUMER_REQUIRED.into());
+            }
+            (c, None)
+        }
+        (true, Some(_)) => {
+            let q = parse_quantity(&input.quantity)?;
+            if !is_other && q.is_none() {
+                return Err(QUANTITY_REQUIRED.into());
+            }
+            (None, q)
+        }
     };
-    if is_cash_in && !is_other && consumer_no.is_none() {
-        return Err(CONSUMER_REQUIRED.into());
-    }
+    let (user, machine) = author(conn)?;
+    let (role_id, role_name) = role.unzip();
 
     let date = time::today();
     let now = time::now_iso();
@@ -242,15 +321,22 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         new_price: Some(price),
         new_consumer_no: consumer_no.clone(),
         new_payment_mode: Some(payment_mode.into()),
+        new_quantity: quantity,
+        user: user.clone(),
+        machine_id: machine,
         timestamp: now.clone(),
         ..Default::default()
     }];
     let id = new_id();
     tx.execute(
         "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product,
-                                   status, audit_log, created_at, updated_at, payment_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10)",
-        params![id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now, payment_mode],
+                                   status, audit_log, created_at, updated_at, payment_mode,
+                                   role_id, role_name, quantity, created_by_user, updated_by_user)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        params![
+            id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now,
+            payment_mode, role_id, role_name, quantity, user
+        ],
     )
     .map_err(db_err)?;
     let dto = tx
@@ -280,13 +366,17 @@ fn load_editable(tx: &Transaction, id: &str) -> R<TransactionDTO> {
 }
 
 fn save_change(tx: &Transaction, row: &TransactionDTO, status: &str, entry: AuditEntry, now: &str) -> R<()> {
+    let (user, machine) = author(tx)?;
     let mut audit = row.audit_log.clone();
-    audit.push(entry);
+    audit.push(AuditEntry { user: user.clone(), machine_id: machine, ..entry });
     tx.execute(
         "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, audit_log = ?6,
-                                 updated_at = ?7, payment_mode = ?8, version = version + 1
+                                 updated_at = ?7, payment_mode = ?8, quantity = ?9, updated_by_user = ?10, version = version + 1
          WHERE id = ?1",
-        params![row.id, row.product_name, row.price, row.consumer_no, status, serde_json::to_string(&audit).unwrap_or_default(), now, row.payment_mode],
+        params![
+            row.id, row.product_name, row.price, row.consumer_no, status, serde_json::to_string(&audit).unwrap_or_default(), now,
+            row.payment_mode, row.quantity, user
+        ],
     )
     .map_err(db_err)?;
     Ok(())
@@ -304,6 +394,9 @@ pub struct UpdateTxInput {
     /// Absent = keep the entry's payment type.
     #[serde(default)]
     pub payment_mode: Option<String>,
+    /// Delivery boy Cash In entries only.
+    #[serde(default)]
+    pub quantity: Value,
 }
 
 pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> {
@@ -318,8 +411,15 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
 
     // Consumer number only applies to Cash In; the Other-product flag is fixed at entry time.
     // Other products keep free text there, which can be added, changed or cleared.
+    // Delivery boy entries take a quantity there instead (the role is fixed at entry time too).
     let mut consumer_no = old.consumer_no.clone();
-    if old.kind == "CASH_IN" {
+    let mut quantity = old.quantity;
+    if old.kind == "CASH_IN" && old.role_id.is_some() {
+        quantity = parse_quantity(&input.quantity)?;
+        if quantity.is_none() && !old.is_other_product {
+            return Err("Quantity is required for this entry.".into());
+        }
+    } else if old.kind == "CASH_IN" {
         let parsed = parse_consumer_field(&input.consumer_no, old.is_other_product)?;
         if parsed.is_none() && !old.is_other_product {
             return Err("Consumer number is required for this entry.".into());
@@ -330,7 +430,12 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         None => old.payment_mode.clone(),
         v => parse_payment_mode(v)?.to_string(),
     };
-    if name == old.product_name && price == old.price && consumer_no == old.consumer_no && payment_mode == old.payment_mode {
+    if name == old.product_name
+        && price == old.price
+        && consumer_no == old.consumer_no
+        && payment_mode == old.payment_mode
+        && quantity == old.quantity
+    {
         return Ok(());
     }
 
@@ -351,9 +456,12 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         new_consumer_no: consumer_no.clone(),
         previous_payment_mode: Some(old.payment_mode.clone()),
         new_payment_mode: Some(payment_mode.clone()),
+        previous_quantity: old.quantity,
+        new_quantity: quantity,
         timestamp: now.clone(),
+        ..Default::default()
     };
-    let new = TransactionDTO { product_name, price, consumer_no, payment_mode, ..old };
+    let new = TransactionDTO { product_name, price, consumer_no, payment_mode, quantity, ..old };
     save_change(&tx, &new, "EDITED", entry, &now)?;
     tx.commit().map_err(db_err)
 }
@@ -369,6 +477,7 @@ pub fn delete_transaction(conn: &mut Connection, id: &str) -> R<()> {
         previous_price: Some(row.price),
         previous_consumer_no: row.consumer_no.clone(),
         previous_payment_mode: Some(row.payment_mode.clone()),
+        previous_quantity: row.quantity,
         timestamp: now.clone(),
         ..Default::default()
     };
@@ -889,11 +998,13 @@ pub fn apply_remote_tx(tx: &Transaction, t: &TransactionDTO, updated_at: &str) -
             let finalized = t.is_day_finalized || is_day_finalized(tx, &t.date_string)?;
             tx.execute(
                 "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product, status,
-                    is_day_finalized, audit_log, created_at, updated_at, payment_mode, created_by, version, synced_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, 1)",
+                    is_day_finalized, audit_log, created_at, updated_at, payment_mode, created_by,
+                    role_id, role_name, quantity, created_by_user, updated_by_user, version, synced_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, 1)",
                 params![
                     t.id, t.date_string, t.kind, t.product_name, t.price, t.consumer_no, t.is_other_product, t.status,
-                    finalized, audit, t.created_at, updated_at, t.payment_mode, t.created_by
+                    finalized, audit, t.created_at, updated_at, t.payment_mode, t.created_by,
+                    t.role_id, t.role_name, t.quantity, t.created_by_user, t.updated_by_user
                 ],
             )
             .map_err(db_err)?;
@@ -903,11 +1014,11 @@ pub fn apply_remote_tx(tx: &Transaction, t: &TransactionDTO, updated_at: &str) -
             tx.execute(
                 "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, is_day_finalized = ?6,
                     audit_log = ?7, updated_at = ?8, payment_mode = ?9, created_by = COALESCE(?10, created_by),
-                    synced_version = version
+                    quantity = ?11, updated_by_user = ?12, synced_version = version
                  WHERE id = ?1",
                 params![
                     t.id, t.product_name, t.price, t.consumer_no, t.status, t.is_day_finalized || local_final, audit,
-                    updated_at, t.payment_mode, t.created_by
+                    updated_at, t.payment_mode, t.created_by, t.quantity, t.updated_by_user
                 ],
             )
             .map_err(db_err)?;
@@ -995,21 +1106,45 @@ pub fn apply_remote_day(tx: &Transaction, remote: &DayCopy) -> R<bool> {
     }
 }
 
-pub fn apply_remote_machine(tx: &Transaction, id: &str, device_name: &str, app_version: Option<&str>, last_seen_at: Option<&str>) -> R<()> {
+pub struct MachineInfo<'a> {
+    pub id: &'a str,
+    pub device_name: &'a str,
+    pub app_version: Option<&'a str>,
+    pub last_seen_at: Option<&'a str>,
+    pub user_name: Option<&'a str>,
+}
+
+pub fn apply_remote_machine(tx: &Transaction, m: &MachineInfo) -> R<()> {
     tx.execute(
-        "INSERT INTO machines (id, device_name, app_version, last_seen_at) VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO machines (id, device_name, app_version, last_seen_at, user_name) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(id) DO UPDATE SET device_name = excluded.device_name, app_version = excluded.app_version,
-                                       last_seen_at = excluded.last_seen_at",
-        params![id, device_name, app_version, last_seen_at],
+                                       last_seen_at = excluded.last_seen_at, user_name = excluded.user_name",
+        params![m.id, m.device_name, m.app_version, m.last_seen_at, m.user_name],
     )
     .map_err(db_err)?;
     Ok(())
 }
 
+/// This PC's own row in the office list, with the current operator name.
+pub fn touch_this_pc(tx: &Transaction, info: &AppInfo) -> R<()> {
+    let user = user_name(tx)?;
+    let now = time::now_iso();
+    apply_remote_machine(
+        tx,
+        &MachineInfo {
+            id: &info.machine_id,
+            device_name: &info.device_name,
+            app_version: Some(&info.app_version),
+            last_seen_at: Some(&now),
+            user_name: user.as_deref(),
+        },
+    )
+}
+
 pub fn office_pcs(conn: &Connection) -> R<Vec<OfficePcDTO>> {
     let me: Option<String> = crate::db::meta_get(conn, "machine_id").map_err(db_err)?;
     let mut stmt = conn
-        .prepare_cached("SELECT id, device_name, app_version, last_seen_at FROM machines ORDER BY device_name COLLATE NOCASE")
+        .prepare_cached("SELECT id, device_name, app_version, last_seen_at, user_name FROM machines ORDER BY device_name COLLATE NOCASE")
         .map_err(db_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -1020,6 +1155,7 @@ pub fn office_pcs(conn: &Connection) -> R<Vec<OfficePcDTO>> {
                 device_name: r.get(1)?,
                 app_version: r.get(2)?,
                 last_seen_at: r.get(3)?,
+                user_name: r.get(4)?,
             })
         })
         .map_err(db_err)?;
@@ -1181,6 +1317,58 @@ mod tests {
         assert_eq!(row.audit_log[1].new_payment_mode.as_deref(), Some("SYSTEM"));
         assert_eq!((row.audit_log[2].previous_payment_mode.as_deref(), row.audit_log[2].new_payment_mode.as_deref()), (Some("SYSTEM"), Some("CASH")));
         assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"bad"})).is_err());
+    }
+
+    #[test]
+    fn delivery_boy_entries_and_operator_name() {
+        let mut c = mem();
+        crate::db::meta_set(&c, "machine_id", "PC-A").unwrap();
+        assert_eq!(set_user_name(&c, "  Tanuj   B ").unwrap().as_deref(), Some("Tanuj B"));
+        let boy = add_delivery_boy(&c, "Suresh").unwrap();
+        let make = |c: &mut Connection, body: Value| create_transaction(c, serde_json::from_value(body).unwrap());
+
+        // A delivery boy's Cash In takes a quantity instead of the consumer number.
+        let base = json!({"type":"CASH_IN","productName":"Refill","price":1800,"roleId":boy.id});
+        let with = |extra: Value| {
+            let mut b = base.clone();
+            b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            b
+        };
+        assert_eq!(make(&mut c, base.clone()).unwrap_err(), QUANTITY_REQUIRED);
+        assert_eq!(make(&mut c, with(json!({"quantity":"0"}))).unwrap_err(), QUANTITY_INVALID);
+        assert_eq!(make(&mut c, with(json!({"quantity":"2.5"}))).unwrap_err(), QUANTITY_INVALID);
+        let t = make(&mut c, with(json!({"quantity":"2","consumerNo":"123456"}))).unwrap();
+        assert_eq!((t.role_name.as_deref(), t.quantity, t.consumer_no.as_deref()), (Some("Suresh"), Some(2), None));
+        assert_eq!((t.created_by_user.as_deref(), t.audit_log[0].user.as_deref()), (Some("Tanuj B"), Some("Tanuj B")));
+        assert_eq!(t.audit_log[0].machine_id.as_deref(), Some("PC-A"));
+        // Other product: the quantity is optional.
+        let other = make(&mut c, with(json!({"isOtherProduct":true}))).unwrap();
+        assert_eq!(other.quantity, None);
+        // Office entries are unchanged: consumer number, no quantity.
+        let office = make(&mut c, json!({"type":"CASH_IN","productName":"Refill","price":900,"consumerNo":"123456","quantity":5})).unwrap();
+        assert_eq!((office.role_id, office.quantity), (None, None));
+        // Cash Out for a delivery boy: no quantity needed.
+        let out = make(&mut c, json!({"type":"CASH_OUT","productName":"Diesel","price":200,"roleId":boy.id})).unwrap();
+        assert_eq!((out.role_name.as_deref(), out.quantity), (Some("Suresh"), None));
+        assert!(make(&mut c, json!({"type":"CASH_IN","productName":"X","price":1,"roleId":"nope","quantity":1})).is_err());
+
+        // Edits by another operator name are recorded with that name.
+        set_user_name(&c, "Ravi").unwrap();
+        let update = |c: &mut Connection, body: Value| update_transaction(c, serde_json::from_value(body).unwrap());
+        assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":1800})).is_err());
+        update(&mut c, json!({"id":t.id,"productName":"Refill","price":1800,"quantity":3})).unwrap();
+        delete_transaction(&mut c, &other.id).unwrap();
+        let rows = transactions_for_date(&c, &time::today()).unwrap();
+        let row = rows.iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!((row.quantity, row.audit_log[1].previous_quantity, row.audit_log[1].user.as_deref()), (Some(3), Some(2), Some("Ravi")));
+        assert_eq!((row.created_by_user.as_deref(), row.updated_by_user.as_deref()), (Some("Tanuj B"), Some("Ravi")));
+        let gone = rows.iter().find(|r| r.id == other.id).unwrap();
+        assert_eq!((gone.status.as_str(), gone.audit_log[1].user.as_deref()), ("DELETED", Some("Ravi")));
+
+        // Without a name, changes still say which PC made them.
+        set_user_name(&c, "   ").unwrap();
+        let anon = make(&mut c, with(json!({"quantity":1}))).unwrap();
+        assert_eq!((anon.created_by_user, anon.audit_log[0].machine_id.as_deref()), (None, Some("PC-A")));
     }
 
     #[test]

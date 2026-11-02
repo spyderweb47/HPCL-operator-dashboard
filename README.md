@@ -7,6 +7,8 @@ in real time whenever the internet is available.
 - **No login.** Each installation is identified by its **Machine ID** (shown in Settings). Every record in the cloud carries it.
 - **Same UI** as the web version: same keyboard flow, same rules (6-digit consumer number, Other product, ghost price, soft delete with audit, finalize lock).
 - **Several PCs, one office.** Every PC set to the same cloud database shares one register, product catalog, delivery boys and day end, updated within a few seconds. See [Several PCs in one office](#several-pcs-in-one-office).
+- **Your name** (Settings → Your Name): a plain name, no password. Every entry, edit and delete made on that PC carries it in the cloud (`createdByUser`, `updatedByUser`, and `user` in each audit step), so the office can see who did what.
+- **Role** on every entry: **Office** by default, or a delivery boy from Settings. For a delivery boy's Cash In, the Consumer No box becomes **Quantity** (required; optional with Other product). The row shows the delivery boy's name under the type.
 - **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online or system entries.
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
 
@@ -43,13 +45,13 @@ entries, edits and deletes, the product catalog (ghost prices), delivery boys an
 
 **Adding a PC:** install HPCL Operator on it, open **Settings → Cloud Database** and enter the same details
 as on the first PC. Within a few seconds it has the office's last 180 days. **Settings → Office PCs** lists every
-PC and when it was last online. All PCs need version 1.5 or newer; the list warns about older ones.
+PC, the name set on it, and when it was last online. All PCs should run version 1.6 or newer (1.5 shares entries but doesn't show roles or quantities); the list warns about older ones.
 
 | Situation | What happens |
 | --- | --- |
-| Entry made on one PC | Appears on the others within about 5 s, without reloading. When the register has entries from more than one PC, each row shows the PC's name under the time. |
+| Entry made on one PC | Appears on the others within about 5 s, without reloading. When the register has entries from more than one person or PC, each row shows who made it (the name from Settings, or the PC's name) under the time. |
 | Same entry edited on two PCs | The later edit wins on every PC (by the time of the edit). The audit trail is kept. |
-| Day End filled on two PCs | Merged **count by count**: each box keeps the number typed last, wherever it was typed, so two people can fill different rows at the same time. A form open on one PC updates with the other PC's numbers as they arrive. |
+| Day End stock filled on two PCs | Merged **count by count**: each box keeps the number typed last, wherever it was typed, so two people can fill different rows at the same time. A form open on one PC updates with the other PC's numbers as they arrive. |
 | Finalize on one PC | Locks the day on every PC. Entries that a PC made offline before it heard about the finalize are still kept and counted. |
 | One PC offline | It keeps working from its own file. When it reconnects, it uploads its changes and downloads the others'. |
 | Same delivery boy added on two PCs while offline | Both show up; deactivate one in Settings. |
@@ -86,7 +88,7 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
 
 **`machines`**: one document per installed PC, updated on every sync and at least every 5 minutes while online.
 ```js
-{ _id: "90D7-C168-32F2-9F5D", deviceName: "OFFICE-PC", os: "windows", appVersion: "1.0.0",
+{ _id: "90D7-C168-32F2-9F5D", deviceName: "OFFICE-PC", userName: "Ramesh" | null, os: "windows", appVersion: "1.0.0",
   retentionDays: 180, pendingCount: 0, firstSeenAt: Date, lastSeenAt: Date }
 ```
 
@@ -95,9 +97,13 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
 { _id: "uuid", machineId, dateString: "2026-10-30", type: "CASH_IN" | "CASH_OUT",
   productName: "Regulator", price: 350.0, consumerNo: "123456" | null, isOtherProduct: false,
   paymentMode: "CASH" | "ONLINE" | "SYSTEM",   // missing on entries from before v1.4 = "CASH"
+  roleId: "delivery boy uuid" | null, roleName: "Suresh Patil" | null,   // null = Office (v1.6+)
+  quantity: 3 | null,                          // delivery boy Cash In entries (v1.6+)
+  createdByUser: "Ramesh" | null, updatedByUser: "Ravi" | null,   // names from Settings (v1.6+)
   status: "ACTIVE" | "EDITED" | "DELETED", isDayFinalized: false,
   auditLog: [{ action: "CREATED"|"UPDATED"|"DELETED", previousProductName, newProductName, previousPrice, newPrice,
-               previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, timestamp: Date }],
+               previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, previousQuantity, newQuantity,
+               user: "Ramesh", machineId: "PC that made this step", timestamp: Date }],
   createdAt: Date, updatedAt: Date, syncedAt: Date,
   updatedBy: "machine id" }   // machineId = the PC that made the entry; updatedBy = the PC that changed it last
 ```
@@ -105,6 +111,7 @@ Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`, `
 
 **`dayendlogs`**: one copy per PC per day (unique index `{machineId, dateString}`). The PCs merge their copies
 count by count, so once synced every copy of a day holds the same numbers; read any one, or merge by the newest `stamps.at` per cell.
+From v1.6 the Day End page records only the cylinder stock; `deliveries` keeps counts saved by older versions.
 ```js
 { machineId, dateString, localId: "uuid",
   deliveries: [{ deliveryBoyId: "uuid", deliveryBoyName: "Suresh Patil", billsPrinted: 12, cylindersDelivered: 11 }],
@@ -135,15 +142,14 @@ count by count, so once synced every copy of a day holds the same numbers; read 
 | Key | Where | Action |
 | --- | --- | --- |
 | `F2` | anywhere | Switch Cash In / Cash Out (goes back to Cash In after each save) |
-| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text) |
+| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text), or for a delivery boy, without a quantity |
 | `F4` / `F6` | anywhere | Tick or untick **Online** / **System** payment. Neither ticked = Cash; goes back to Cash after each save. |
 | type, `↑`/`↓`, `Tab`/`Enter` | Product | Autocomplete from the catalog, then go to Consumer No (Cash In) or Price |
 | `Esc` | Product | Keep the typed text as a **new item** |
-| `Enter`/`Tab` | Consumer No | Go to Price. Blocked until it's exactly 6 digits (or empty with Other product). |
+| `Enter`/`Tab` | Consumer No / Quantity | Go to Price. Blocked until it's exactly 6 digits / a quantity (or empty with Other product). |
 | `Enter` | Price | Save. Empty Price uses the grey ghost price. |
 | `Esc` | Consumer No / Price | Go back one box |
 | `Enter` / `Esc` | inline row edit | Save / cancel |
-| `Enter` | Day End count cell | Next delivery boy, same column |
 | `Ctrl+S` | Day End | Save now (it also saves by itself a moment after each change) |
 
 ## Development

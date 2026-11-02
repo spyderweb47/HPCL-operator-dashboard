@@ -20,6 +20,7 @@ export function HistoryPage() {
 
   const log = data?.dayEnd ?? null;
   const rows = data?.transactions ?? [];
+  const deliveries = (log?.deliveries ?? []).filter((d) => d.cylindersDelivered > 0);
   const empty = rows.length === 0 && !log;
 
   return (
@@ -71,8 +72,9 @@ export function HistoryPage() {
         <>
           <TotalsBar totals={computeTotals(rows)} />
           <RegisterTable rows={rows} editable={false} title="Cash In / Cash Out Register" />
-          <div className="grid gap-4 lg:grid-cols-2">
-            <DeliveriesView deliveries={log?.deliveries ?? []} />
+          {/* Delivery counts were only recorded before v1.6: shown just for those days. */}
+          <div className={`grid gap-4 ${deliveries.length ? "lg:grid-cols-2" : ""}`}>
+            {deliveries.length > 0 && <DeliveriesView deliveries={deliveries} />}
             {log ? (
               <StockView stock={log.cylinderStock} />
             ) : (

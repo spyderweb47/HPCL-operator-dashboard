@@ -22,7 +22,6 @@ export function Card({ title, icon: Icon, children, aside }: { title: string; ic
 }
 
 export function DeliveriesView({ deliveries }: { deliveries: DeliveryDTO[] }) {
-  const bills = deliveries.reduce((s, d) => s + d.billsPrinted, 0);
   const cyl = deliveries.reduce((s, d) => s + d.cylindersDelivered, 0);
   return (
     <Card title="Delivery Boy Logs" icon={Bike}>
@@ -30,40 +29,29 @@ export function DeliveriesView({ deliveries }: { deliveries: DeliveryDTO[] }) {
         <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
           <tr>
             <th className="px-4 py-2">Delivery Boy</th>
-            <th className="px-4 py-2 text-right">Bills Printed</th>
             <th className="px-4 py-2 text-right">Cylinders Delivered</th>
-            <th className="px-4 py-2 text-right">Difference</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {deliveries.length === 0 && (
             <tr>
-              <td colSpan={4} className="px-4 py-8 text-center text-slate-400">
+              <td colSpan={2} className="px-4 py-8 text-center text-slate-400">
                 No delivery logs recorded.
               </td>
             </tr>
           )}
-          {deliveries.map((d) => {
-            const diff = d.billsPrinted - d.cylindersDelivered;
-            return (
-              <tr key={d.deliveryBoyId}>
-                <td className="px-4 py-2 font-medium">{d.deliveryBoyName}</td>
-                <td className="tabular px-4 py-2 text-right">{d.billsPrinted}</td>
-                <td className="tabular px-4 py-2 text-right">{d.cylindersDelivered}</td>
-                <td className={`tabular px-4 py-2 text-right font-semibold ${diff === 0 ? "text-slate-400" : "text-amber-700"}`}>
-                  {diff > 0 ? `+${diff}` : diff}
-                </td>
-              </tr>
-            );
-          })}
+          {deliveries.map((d) => (
+            <tr key={d.deliveryBoyId}>
+              <td className="px-4 py-2 font-medium">{d.deliveryBoyName}</td>
+              <td className="tabular px-4 py-2 text-right">{d.cylindersDelivered}</td>
+            </tr>
+          ))}
         </tbody>
         {deliveries.length > 0 && (
           <tfoot className="border-t-2 border-slate-200 bg-slate-50 font-semibold">
             <tr>
               <td className="px-4 py-2">Total</td>
-              <td className="tabular px-4 py-2 text-right">{bills}</td>
               <td className="tabular px-4 py-2 text-right">{cyl}</td>
-              <td className="tabular px-4 py-2 text-right">{bills - cyl > 0 ? `+${bills - cyl}` : bills - cyl}</td>
             </tr>
           </tfoot>
         )}

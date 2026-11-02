@@ -39,7 +39,7 @@ impl Core {
         };
         // This PC is always in its own office list, online or not.
         let tx = conn.transaction().map_err(db_err)?;
-        store::apply_remote_machine(&tx, &info.machine_id, &info.device_name, Some(&info.app_version), Some(&time::now_iso()))?;
+        store::touch_this_pc(&tx, &info)?;
         tx.commit().map_err(db_err)?;
         Ok(Arc::new(Core { db: Mutex::new(conn), info, sync: SyncShared::new(config), config_dir: config_dir.to_path_buf() }))
     }
@@ -150,6 +150,18 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
             cloud_config::clear(&core.config_dir)?;
             core.sync.set_config(cloud_config::load(&core.config_dir));
             out(cloud_config::describe(core.sync.config().as_ref()))
+        }
+        "get_user_name" => out(core.with_db(|c| store::user_name(c))?),
+        "set_user_name" => {
+            let a: Name = arg(args)?;
+            // Wakes the sync worker, which reports the new name with this PC to the cloud.
+            write(out(core.with_db(|c| {
+                let name = store::set_user_name(c, &a.name)?;
+                let tx = c.transaction().map_err(db_err)?;
+                store::touch_this_pc(&tx, &core.info)?;
+                tx.commit().map_err(db_err)?;
+                Ok(name)
+            })?))
         }
         "sync_status" => out(cloud::status(core)),
         "list_office_pcs" => out(core.with_db(|c| store::office_pcs(c))?),
