@@ -7,7 +7,7 @@
 /src-tauri/gen/schemas
 
 # local data used by `npm run bridge`
-/.dev-data
+/.dev-data*
 
 # misc
 .DS_Store

@@ -4,7 +4,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 use crate::model::*;
@@ -113,8 +113,12 @@ fn count(v: &Value) -> i64 {
 // Transactions
 // ---------------------------------------------------------------------------------------------
 
+/// `created_by` NULL = made on this PC before v1.5; the device name comes from the office PC list.
 const TX_COLS: &str = "id, date_string, type, product_name, price, consumer_no, is_other_product, status, \
-                       is_day_finalized, created_at, audit_log, version, synced_version, payment_mode";
+                       is_day_finalized, created_at, audit_log, version, synced_version, payment_mode, \
+                       COALESCE(created_by, (SELECT value FROM meta WHERE key = 'machine_id')), \
+                       (SELECT device_name FROM machines \
+                         WHERE machines.id = COALESCE(transactions.created_by, (SELECT value FROM meta WHERE key = 'machine_id')))";
 
 fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
     let audit: String = r.get(10)?;
@@ -129,6 +133,8 @@ fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
         consumer_no: r.get(5)?,
         is_other_product: r.get(6)?,
         payment_mode: r.get(13)?,
+        created_by: r.get(14)?,
+        created_by_name: r.get(15)?,
         status: r.get(7)?,
         is_day_finalized: r.get(8)?,
         created_at: r.get(9)?,
@@ -560,6 +566,184 @@ pub struct DayEndInput {
     pub deliveries: Vec<DeliveryInput>,
     #[serde(default)]
     pub cylinder_stock: Value,
+    /// The counts the form last loaded or saved. Only cells the operator changed since then are
+    /// written, so counts typed meanwhile on another PC are not overwritten. Absent = all cells.
+    #[serde(default)]
+    pub base: Option<DayEndBase>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayEndBase {
+    #[serde(default)]
+    pub deliveries: Vec<DeliveryInput>,
+    #[serde(default)]
+    pub cylinder_stock: Value,
+}
+
+// Day End counts are merged between PCs one cell at a time ("bills:<boy id>", "cyl:<boy id>",
+// "kg14.full", …): each cell keeps the value typed last, wherever it was typed.
+
+/// When each cell was last typed (ISO time).
+pub type Stamps = BTreeMap<String, String>;
+type Cells = BTreeMap<String, i64>;
+
+const STOCK_CELLS: [&str; 3] = ["kg5", "kg14", "kg19"];
+
+fn stock_pair(s: &CylinderStock, k: &str) -> StockPair {
+    match k {
+        "kg5" => s.kg5,
+        "kg14" => s.kg14,
+        _ => s.kg19,
+    }
+}
+
+fn to_cells(deliveries: &[DeliveryDTO], stock: &CylinderStock) -> Cells {
+    let mut c = Cells::new();
+    for d in deliveries {
+        c.insert(format!("bills:{}", d.delivery_boy_id), d.bills_printed);
+        c.insert(format!("cyl:{}", d.delivery_boy_id), d.cylinders_delivered);
+    }
+    for k in STOCK_CELLS {
+        let p = stock_pair(stock, k);
+        c.insert(format!("{k}.full"), p.full);
+        c.insert(format!("{k}.empty"), p.empty);
+    }
+    c
+}
+
+/// Back to the stored shape. Rows are sorted by name so equal data always looks equal.
+fn from_cells(c: &Cells, names: &HashMap<String, String>) -> (Vec<DeliveryDTO>, CylinderStock) {
+    let get = |k: &str| c.get(k).copied().unwrap_or(0);
+    let mut deliveries: Vec<DeliveryDTO> = c
+        .keys()
+        .filter_map(|k| k.strip_prefix("bills:").or_else(|| k.strip_prefix("cyl:")))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|id| DeliveryDTO {
+            delivery_boy_id: id.to_string(),
+            delivery_boy_name: names.get(id).cloned().unwrap_or_default(),
+            bills_printed: get(&format!("bills:{id}")),
+            cylinders_delivered: get(&format!("cyl:{id}")),
+        })
+        .collect();
+    deliveries.sort_by(|a, b| a.delivery_boy_name.to_lowercase().cmp(&b.delivery_boy_name.to_lowercase()).then(a.delivery_boy_id.cmp(&b.delivery_boy_id)));
+    let pair = |k: &str| StockPair { full: get(&format!("{k}.full")), empty: get(&format!("{k}.empty")) };
+    (deliveries, CylinderStock { kg5: pair("kg5"), kg14: pair("kg14"), kg19: pair("kg19") })
+}
+
+/// A day-end log as stored: on this PC, or one PC's copy in the cloud.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DayCopy {
+    pub day: DayEndDTO,
+    /// None = saved before v1.5: every cell counts as typed at `updated_at`.
+    pub stamps: Option<Stamps>,
+    pub updated_at: String,
+}
+
+impl DayCopy {
+    fn cells(&self) -> Cells {
+        to_cells(&self.day.deliveries, &self.day.cylinder_stock)
+    }
+    fn names(&self) -> HashMap<String, String> {
+        self.day.deliveries.iter().map(|d| (d.delivery_boy_id.clone(), d.delivery_boy_name.clone())).collect()
+    }
+    /// When a cell was typed; -1 = never (a zero nobody entered).
+    fn stamp(&self, cell: &str) -> i64 {
+        match &self.stamps {
+            None => time::iso_to_millis(&self.updated_at),
+            Some(s) => s.get(cell).map_or(-1, |t| time::iso_to_millis(t)),
+        }
+    }
+}
+
+/// Combine two copies of the same day. The same inputs give the same result on every PC.
+pub fn merge_day(a: &DayCopy, b: &DayCopy) -> DayCopy {
+    let (ca, cb) = (a.cells(), b.cells());
+    let mut cells = Cells::new();
+    let mut stamps = Stamps::new();
+    for k in ca.keys().chain(cb.keys()) {
+        if cells.contains_key(k) {
+            continue;
+        }
+        let pick = |c: &DayCopy, v: Option<&i64>| v.map(|v| (c.stamp(k), *v));
+        let (stamp, value) = match (pick(a, ca.get(k)), pick(b, cb.get(k))) {
+            (Some(x), Some(y)) => x.max(y), // newer wins; a tie goes to the larger count
+            (x, y) => x.or(y).unwrap_or((-1, 0)),
+        };
+        cells.insert(k.clone(), value);
+        if stamp >= 0 {
+            stamps.insert(k.clone(), time::millis_to_iso(stamp));
+        }
+    }
+    let mut names = b.names();
+    names.extend(a.names()); // a = this PC: its (current) names win
+    let (deliveries, cylinder_stock) = from_cells(&cells, &names);
+    let finalized_at = match (&a.day.finalized_at, &b.day.finalized_at) {
+        (Some(x), Some(y)) => Some(x.min(y).clone()),
+        (x, y) => x.clone().or(y.clone()),
+    };
+    DayCopy {
+        day: DayEndDTO {
+            date_string: a.day.date_string.clone(),
+            is_finalized: a.day.is_finalized || b.day.is_finalized,
+            finalized_at,
+            deliveries,
+            cylinder_stock,
+        },
+        stamps: Some(stamps),
+        updated_at: a.updated_at.clone().max(b.updated_at.clone()),
+    }
+}
+
+fn load_day(conn: &Connection, date: &str) -> R<Option<DayCopy>> {
+    let row = conn
+        .query_row("SELECT stamps, updated_at FROM day_end_logs WHERE date_string = ?1", [date], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+        })
+        .optional()
+        .map_err(db_err)?;
+    let Some((stamps, updated_at)) = row else { return Ok(None) };
+    let day = get_day_end(conn, date)?.unwrap_or_else(|| blank_day_end(date));
+    Ok(Some(DayCopy { day, stamps: stamps.and_then(|s| serde_json::from_str(&s).ok()), updated_at }))
+}
+
+/// Write a day's merged state. `upload`: whether the cloud needs this PC's copy again.
+fn store_day(tx: &Transaction, d: &DayCopy, upload: bool) -> R<()> {
+    let day = &d.day;
+    let stamps = d.stamps.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default());
+    tx.execute(
+        "INSERT INTO day_end_logs (id, date_string, deliveries, cylinder_stock, is_finalized, finalized_at, stamps,
+                                   created_at, updated_at, version, synced_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1, ?9)
+         ON CONFLICT(date_string) DO UPDATE SET deliveries = excluded.deliveries,
+                                                cylinder_stock = excluded.cylinder_stock,
+                                                is_finalized = excluded.is_finalized,
+                                                finalized_at = excluded.finalized_at,
+                                                stamps = excluded.stamps,
+                                                updated_at = excluded.updated_at,
+                                                version = version + 1,
+                                                synced_version = CASE WHEN ?10 THEN synced_version ELSE version + 1 END",
+        params![
+            new_id(),
+            day.date_string,
+            serde_json::to_string(&day.deliveries).unwrap_or_default(),
+            serde_json::to_string(&day.cylinder_stock).unwrap_or_default(),
+            day.is_finalized,
+            day.finalized_at,
+            stamps,
+            d.updated_at,
+            if upload { 0 } else { 1 },
+            upload
+        ],
+    )
+    .map_err(db_err)?;
+    if day.is_finalized {
+        // Lock the day's entries on this PC too (a flag derived from the day, not a change to upload).
+        tx.execute("UPDATE transactions SET is_day_finalized = 1 WHERE date_string = ?1 AND is_day_finalized = 0", [&day.date_string])
+            .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 /// Rows must be an active delivery boy (or someone already saved today who was deactivated
@@ -585,36 +769,73 @@ fn sanitize(conn: &Connection, input: &DayEndInput, saved: &[DeliveryDTO]) -> R<
             cylinders_delivered: count(&d.cylinders_delivered),
         });
     }
-    let s = &input.cylinder_stock;
-    let pair = |k: &str| StockPair { full: count(&s[k]["full"]), empty: count(&s[k]["empty"]) };
-    Ok((deliveries, CylinderStock { kg5: pair("kg5"), kg14: pair("kg14"), kg19: pair("kg19") }))
+    Ok((deliveries, parse_stock(&input.cylinder_stock)))
 }
 
-fn save_today(tx: &Transaction, input: &DayEndInput, now: &str) -> R<String> {
+fn parse_stock(s: &Value) -> CylinderStock {
+    let pair = |k: &str| StockPair { full: count(&s[k]["full"]), empty: count(&s[k]["empty"]) };
+    CylinderStock { kg5: pair("kg5"), kg14: pair("kg14"), kg19: pair("kg19") }
+}
+
+fn base_cells(b: &DayEndBase) -> Cells {
+    let deliveries: Vec<DeliveryDTO> = b
+        .deliveries
+        .iter()
+        .map(|d| DeliveryDTO {
+            delivery_boy_id: d.delivery_boy_id.clone(),
+            delivery_boy_name: String::new(),
+            bills_printed: count(&d.bills_printed),
+            cylinders_delivered: count(&d.cylinders_delivered),
+        })
+        .collect();
+    to_cells(&deliveries, &parse_stock(&b.cylinder_stock))
+}
+
+/// Apply the operator's changes to today's log. Returns false when nothing changed.
+fn save_today(tx: &Transaction, input: &DayEndInput, now: &str) -> R<(String, bool)> {
     let date = time::today();
-    let existing = get_day_end(tx, &date)?;
-    if existing.as_ref().is_some_and(|e| e.is_finalized) {
+    let existing = load_day(tx, &date)?;
+    if existing.as_ref().is_some_and(|e| e.day.is_finalized) {
         return Err("Today is already finalized.".into());
     }
-    let saved = existing.map(|e| e.deliveries).unwrap_or_default();
+    let saved = existing.as_ref().map(|e| e.day.deliveries.clone()).unwrap_or_default();
     let (deliveries, stock) = sanitize(tx, input, &saved)?;
-    tx.execute(
-        "INSERT INTO day_end_logs (id, date_string, deliveries, cylinder_stock, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-         ON CONFLICT(date_string) DO UPDATE SET deliveries = excluded.deliveries,
-                                                cylinder_stock = excluded.cylinder_stock,
-                                                updated_at = excluded.updated_at,
-                                                version = version + 1",
-        params![
-            new_id(),
-            date,
-            serde_json::to_string(&deliveries).unwrap_or_default(),
-            serde_json::to_string(&stock).unwrap_or_default(),
-            now
-        ],
-    )
-    .map_err(db_err)?;
-    Ok(date)
+    let typed = to_cells(&deliveries, &stock);
+    let base = input.base.as_ref().map(base_cells);
+
+    let mut cells = existing.as_ref().map(|e| e.cells()).unwrap_or_default();
+    // Logs from before v1.5: give every existing cell the log's own time.
+    let mut stamps = match &existing {
+        Some(DayCopy { stamps: Some(s), .. }) => s.clone(),
+        Some(e) => cells.keys().map(|k| (k.clone(), e.updated_at.clone())).collect(),
+        None => Stamps::new(),
+    };
+    let mut changed = existing.is_none() || existing.as_ref().is_some_and(|e| e.stamps.is_none());
+    for (k, v) in &typed {
+        let operator_changed = base.as_ref().is_none_or(|b| b.get(k).copied().unwrap_or(0) != *v);
+        if operator_changed && cells.get(k) != Some(v) {
+            cells.insert(k.clone(), *v);
+            stamps.insert(k.clone(), now.to_string());
+            changed = true;
+        } else if !cells.contains_key(k) {
+            cells.insert(k.clone(), *v); // a row nobody has typed in yet
+            changed = true;
+        }
+    }
+    let mut names = existing.as_ref().map(|e| e.names()).unwrap_or_default();
+    for d in &deliveries {
+        if names.get(&d.delivery_boy_id) != Some(&d.delivery_boy_name) {
+            names.insert(d.delivery_boy_id.clone(), d.delivery_boy_name.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok((date, false));
+    }
+    let (deliveries, cylinder_stock) = from_cells(&cells, &names);
+    let day = DayEndDTO { date_string: date.clone(), is_finalized: false, finalized_at: None, deliveries, cylinder_stock };
+    store_day(tx, &DayCopy { day, stamps: Some(stamps), updated_at: now.to_string() }, true)?;
+    Ok((date, true))
 }
 
 pub fn save_day_end(conn: &mut Connection, input: DayEndInput) -> R<Value> {
@@ -629,7 +850,7 @@ pub fn save_day_end(conn: &mut Connection, input: DayEndInput) -> R<Value> {
 pub fn finalize_day(conn: &mut Connection, input: DayEndInput) -> R<()> {
     let now = time::now_iso();
     let tx = conn.transaction().map_err(db_err)?;
-    let date = save_today(&tx, &input, &now)?;
+    let (date, _) = save_today(&tx, &input, &now)?;
     tx.execute(
         "UPDATE day_end_logs SET is_finalized = 1, finalized_at = ?2, updated_at = ?2, version = version + 1 WHERE date_string = ?1",
         params![date, now],
@@ -642,6 +863,167 @@ pub fn finalize_day(conn: &mut Connection, input: DayEndInput) -> R<()> {
     )
     .map_err(db_err)?;
     tx.commit().map_err(db_err)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Changes from the other PCs of the office (downloaded by the sync worker)
+// ---------------------------------------------------------------------------------------------
+// Every row keeps its newest version (by its last change time). What comes from the cloud is
+// marked as already synced, so it isn't uploaded back.
+
+fn newer(remote: &str, local: &str) -> bool {
+    time::iso_to_millis(remote) > time::iso_to_millis(local)
+}
+
+/// An entry from the cloud. Returns true when this PC's data changed.
+pub fn apply_remote_tx(tx: &Transaction, t: &TransactionDTO, updated_at: &str) -> R<bool> {
+    let local = tx
+        .query_row("SELECT updated_at, is_day_finalized FROM transactions WHERE id = ?1", [&t.id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+        })
+        .optional()
+        .map_err(db_err)?;
+    let audit = serde_json::to_string(&t.audit_log).unwrap_or_default();
+    match local {
+        None => {
+            let finalized = t.is_day_finalized || is_day_finalized(tx, &t.date_string)?;
+            tx.execute(
+                "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product, status,
+                    is_day_finalized, audit_log, created_at, updated_at, payment_mode, created_by, version, synced_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, 1)",
+                params![
+                    t.id, t.date_string, t.kind, t.product_name, t.price, t.consumer_no, t.is_other_product, t.status,
+                    finalized, audit, t.created_at, updated_at, t.payment_mode, t.created_by
+                ],
+            )
+            .map_err(db_err)?;
+            Ok(true)
+        }
+        Some((local_updated, local_final)) if newer(updated_at, &local_updated) => {
+            tx.execute(
+                "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, is_day_finalized = ?6,
+                    audit_log = ?7, updated_at = ?8, payment_mode = ?9, created_by = COALESCE(?10, created_by),
+                    synced_version = version
+                 WHERE id = ?1",
+                params![
+                    t.id, t.product_name, t.price, t.consumer_no, t.status, t.is_day_finalized || local_final, audit,
+                    updated_at, t.payment_mode, t.created_by
+                ],
+            )
+            .map_err(db_err)?;
+            Ok(true)
+        }
+        Some((_, false)) if t.is_day_finalized => {
+            tx.execute("UPDATE transactions SET is_day_finalized = 1 WHERE id = ?1", [&t.id]).map_err(db_err)?;
+            Ok(true)
+        }
+        Some(_) => Ok(false),
+    }
+}
+
+pub fn apply_remote_delivery_boy(tx: &Transaction, b: &DeliveryBoyDTO, updated_at: &str) -> R<bool> {
+    let local: Option<String> = tx
+        .query_row("SELECT updated_at FROM delivery_boys WHERE id = ?1", [&b.id], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    if local.as_deref().is_some_and(|l| !newer(updated_at, l)) {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO delivery_boys (id, name, is_active, created_at, updated_at, version, synced_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, is_active = excluded.is_active,
+                                       updated_at = excluded.updated_at, synced_version = version",
+        params![b.id, b.name, b.is_active, b.created_at, updated_at],
+    )
+    .map_err(db_err)?;
+    Ok(true)
+}
+
+/// Catalog entries are matched by name; the most recently used price wins.
+pub fn apply_remote_product(tx: &Transaction, name: &str, price: f64, created_at: &str, updated_at: &str) -> R<bool> {
+    let name = clean_name(name);
+    if name.is_empty() {
+        return Ok(false);
+    }
+    let local: Option<String> = tx
+        .query_row("SELECT updated_at FROM products WHERE name = ?1", [&name], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    match local {
+        Some(l) if !newer(updated_at, &l) => Ok(false),
+        Some(_) => {
+            tx.execute(
+                "UPDATE products SET last_used_price = ?2, updated_at = ?3, synced_version = version WHERE name = ?1",
+                params![name, price, updated_at],
+            )
+            .map_err(db_err)?;
+            Ok(true)
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO products (id, name, last_used_price, created_at, updated_at, version, synced_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)",
+                params![new_id(), name, price, created_at, updated_at],
+            )
+            .map_err(db_err)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Another PC's copy of a day's counts, merged cell by cell into this PC's.
+pub fn apply_remote_day(tx: &Transaction, remote: &DayCopy) -> R<bool> {
+    let date = &remote.day.date_string;
+    if !time::is_valid_date(date) {
+        return Ok(false);
+    }
+    match load_day(tx, date)? {
+        None => {
+            store_day(tx, remote, false)?;
+            Ok(true)
+        }
+        Some(local) => {
+            let merged = merge_day(&local, remote);
+            if merged.day == local.day && merged.stamps == local.stamps {
+                return Ok(false);
+            }
+            // This PC's copy in the cloud gets the merged counts too, so every copy ends up equal.
+            store_day(tx, &merged, true)?;
+            Ok(true)
+        }
+    }
+}
+
+pub fn apply_remote_machine(tx: &Transaction, id: &str, device_name: &str, app_version: Option<&str>, last_seen_at: Option<&str>) -> R<()> {
+    tx.execute(
+        "INSERT INTO machines (id, device_name, app_version, last_seen_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET device_name = excluded.device_name, app_version = excluded.app_version,
+                                       last_seen_at = excluded.last_seen_at",
+        params![id, device_name, app_version, last_seen_at],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+pub fn office_pcs(conn: &Connection) -> R<Vec<OfficePcDTO>> {
+    let me: Option<String> = crate::db::meta_get(conn, "machine_id").map_err(db_err)?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id, device_name, app_version, last_seen_at FROM machines ORDER BY device_name COLLATE NOCASE")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: String = r.get(0)?;
+            Ok(OfficePcDTO {
+                is_this_pc: me.as_deref() == Some(id.as_str()),
+                machine_id: id,
+                device_name: r.get(1)?,
+                app_version: r.get(2)?,
+                last_seen_at: r.get(3)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -818,6 +1200,140 @@ mod tests {
         }
         let c = crate::db::open(&path).unwrap();
         assert_eq!(transactions_for_date(&c, &time::today()).unwrap()[0].payment_mode, "CASH");
+    }
+
+    /// Copy everything PC `from` has into PC `to`, the way the sync worker would.
+    fn sync(from: &Connection, to: &mut Connection) {
+        let today = time::today();
+        let txs = transactions_for_date(from, &today).unwrap();
+        let ups: Vec<String> = txs
+            .iter()
+            .map(|t| from.query_row("SELECT updated_at FROM transactions WHERE id = ?1", [&t.id], |r| r.get(0)).unwrap())
+            .collect();
+        let day = load_day(from, &today).unwrap();
+        let boys: Vec<(DeliveryBoyDTO, String)> = list_delivery_boys(from)
+            .unwrap()
+            .into_iter()
+            .map(|b| {
+                let u = from.query_row("SELECT updated_at FROM delivery_boys WHERE id = ?1", [&b.id], |r| r.get(0)).unwrap();
+                (b, u)
+            })
+            .collect();
+        let tx = to.transaction().unwrap();
+        for (b, u) in &boys {
+            apply_remote_delivery_boy(&tx, b, u).unwrap();
+        }
+        for (t, u) in txs.iter().zip(&ups) {
+            apply_remote_tx(&tx, t, u).unwrap();
+        }
+        if let Some(d) = day {
+            apply_remote_day(&tx, &d).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn day_input(boy: &str, bills: i64, kg14_full: i64, base: Option<(i64, i64)>) -> DayEndInput {
+        let mut v = json!({"deliveries":[{"deliveryBoyId":boy,"billsPrinted":bills}],"cylinderStock":{"kg14":{"full":kg14_full}}});
+        if let Some((b, f)) = base {
+            v["base"] = json!({"deliveries":[{"deliveryBoyId":boy,"billsPrinted":b}],"cylinderStock":{"kg14":{"full":f}}});
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(5)); // distinct timestamps
+    }
+
+    #[test]
+    fn two_pcs_share_one_office() {
+        let (mut a, mut b) = (mem(), mem());
+        let boy = add_delivery_boy(&a, "Suresh").unwrap();
+        let t = cash_in(&mut a, "Refill", json!(900), "123456").unwrap();
+        sync(&a, &mut b);
+        // B sees A's entry and delivery boy, and doesn't upload them back.
+        assert_eq!(transactions_for_date(&b, &time::today()).unwrap().len(), 1);
+        assert_eq!(list_delivery_boys(&b).unwrap()[0].name, "Suresh");
+        assert_eq!(pending_count(&b).unwrap(), 0);
+        // Applying the same change again is a no-op.
+        let again = b.transaction().unwrap();
+        let up: String = a.query_row("SELECT updated_at FROM transactions WHERE id = ?1", [&t.id], |r| r.get(0)).unwrap();
+        assert!(!apply_remote_tx(&again, &transactions_for_date(&a, &time::today()).unwrap()[0], &up).unwrap());
+        again.commit().unwrap();
+
+        // Both edit the same entry: the later edit wins on both PCs.
+        tick();
+        update_transaction(&mut a, serde_json::from_value(json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456"})).unwrap()).unwrap();
+        tick();
+        update_transaction(&mut b, serde_json::from_value(json!({"id":t.id,"productName":"Refill","price":1000,"consumerNo":"123456"})).unwrap()).unwrap();
+        sync(&a, &mut b);
+        sync(&b, &mut a);
+        let price = |c: &Connection| transactions_for_date(c, &time::today()).unwrap()[0].price;
+        assert_eq!((price(&a), price(&b)), (1000.0, 1000.0));
+
+        // Day End: A types bills while B (with a form loaded earlier) types stock. Neither overwrites the other.
+        save_day_end(&mut a, day_input(&boy.id, 12, 0, Some((0, 0)))).unwrap();
+        tick();
+        save_day_end(&mut b, day_input(&boy.id, 0, 40, Some((0, 0)))).unwrap();
+        sync(&a, &mut b);
+        sync(&b, &mut a);
+        sync(&a, &mut b);
+        let counts = |c: &Connection| {
+            let d = get_day_end(c, &time::today()).unwrap().unwrap();
+            (d.deliveries[0].bills_printed, d.cylinder_stock.kg14.full)
+        };
+        assert_eq!((counts(&a), counts(&b)), ((12, 40), (12, 40)));
+        // A's form still shows kg14.full = 0 from before; saving it again must not wipe B's 40.
+        tick();
+        save_day_end(&mut a, day_input(&boy.id, 15, 0, Some((12, 0)))).unwrap();
+        assert_eq!(counts(&a), (15, 40));
+
+        // Finalizing on B locks the day on A.
+        finalize_day(&mut b, day_input(&boy.id, 12, 40, Some((12, 40)))).unwrap();
+        sync(&b, &mut a);
+        assert!(is_day_finalized(&a, &time::today()).unwrap());
+        assert!(transactions_for_date(&a, &time::today()).unwrap()[0].is_day_finalized);
+        assert!(cash_in(&mut a, "Refill", json!(900), "123456").unwrap_err().contains("finalized"));
+    }
+
+    #[test]
+    fn day_merge_is_the_same_both_ways_and_handles_old_logs() {
+        let day = |bills: i64, full: i64| DayEndDTO {
+            date_string: "2026-11-02".into(),
+            is_finalized: false,
+            finalized_at: None,
+            deliveries: vec![DeliveryDTO { delivery_boy_id: "x".into(), delivery_boy_name: "X".into(), bills_printed: bills, cylinders_delivered: 0 }],
+            cylinder_stock: CylinderStock { kg14: StockPair { full, empty: 0 }, ..Default::default() },
+        };
+        let stamps = |cells: &[(&str, &str)]| Some(cells.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Stamps>());
+        let a = DayCopy { day: day(5, 0), stamps: stamps(&[("bills:x", "2026-11-02T10:00:00.000Z")]), updated_at: "2026-11-02T10:00:00.000Z".into() };
+        let b = DayCopy { day: day(0, 30), stamps: stamps(&[("kg14.full", "2026-11-02T09:00:00.000Z")]), updated_at: "2026-11-02T11:00:00.000Z".into() };
+        let (ab, ba) = (merge_day(&a, &b), merge_day(&b, &a));
+        assert_eq!(ab, ba);
+        assert_eq!((ab.day.deliveries[0].bills_printed, ab.day.cylinder_stock.kg14.full), (5, 30));
+        // A log saved before v1.5 (no stamps) counts as typed at its own time.
+        let old = DayCopy { day: day(9, 9), stamps: None, updated_at: "2026-11-02T09:30:00.000Z".into() };
+        let m = merge_day(&a, &old);
+        assert_eq!((m.day.deliveries[0].bills_printed, m.day.cylinder_stock.kg14.full), (5, 9));
+    }
+
+    #[test]
+    fn upgrade_from_v1_4_database_keeps_delivery_boys() {
+        let path = std::env::temp_dir().join(format!("hpcl-upgrade14-{}.db", new_id()));
+        {
+            let mut old = Connection::open(&path).unwrap();
+            let tx = old.transaction().unwrap();
+            tx.execute_batch(crate::db::MIGRATIONS[0]).unwrap();
+            tx.execute_batch(crate::db::MIGRATIONS[1]).unwrap();
+            tx.pragma_update(None, "user_version", 2).unwrap();
+            tx.execute("INSERT INTO delivery_boys (id, name, created_at, updated_at) VALUES ('b1', 'Ramesh', 'x', 'x')", []).unwrap();
+            tx.commit().unwrap();
+        }
+        let c = crate::db::open(&path).unwrap();
+        assert_eq!(list_delivery_boys(&c).unwrap()[0].name, "Ramesh");
+        // Same name from another PC (added there while offline) no longer breaks the download.
+        let tx = Connection::open(&path).unwrap();
+        tx.execute("INSERT INTO delivery_boys (id, name, created_at, updated_at) VALUES ('b2', 'ramesh', 'x', 'x')", []).unwrap();
+        assert!(add_delivery_boy(&c, "RAMESH").is_err());
     }
 
     #[test]

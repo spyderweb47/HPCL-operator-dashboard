@@ -41,6 +41,8 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const [, startTransition] = useTransition();
 
   const deletedCount = rows.filter((r) => r.status === "DELETED").length;
+  // Entries from more than one PC of the office: show which PC made each one.
+  const severalPcs = new Set(rows.map((r) => r.createdBy)).size > 1;
   const visible = showDeleted ? rows : rows.filter((r) => r.status !== "DELETED");
 
   const startEdit = (r: TransactionDTO) => {
@@ -164,6 +166,11 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         </span>
                       )}
                     </span>
+                    {severalPcs && (
+                      <span title={`Entered on ${r.createdByName ?? "another PC"}`} className="block max-w-24 truncate text-[10px] text-slate-400">
+                        {r.createdByName ?? "Other PC"}
+                      </span>
+                    )}
                   </td>
                   <td className="whitespace-nowrap px-2 py-2">
                     <span

@@ -1,9 +1,9 @@
 import { useState, type FormEvent, type KeyboardEvent } from "react";
-import { Bike, Check, Copy, Loader2, Monitor, Pencil, Plus, RotateCcw, UserX, X } from "lucide-react";
+import { Bike, Check, Copy, Loader2, Monitor, Network, Pencil, Plus, RotateCcw, UserX, X } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
-import type { AppInfoDTO, DeliveryBoyDTO, SyncStatusDTO } from "@/lib/types";
+import type { AppInfoDTO, DeliveryBoyDTO, OfficePcDTO, SyncStatusDTO } from "@/lib/types";
 import { CloudSettings } from "@/components/CloudSettings";
 import { Card } from "@/components/DayEndViews";
 import { LoadError } from "@/components/LoadError";
@@ -17,6 +17,7 @@ export function SettingsPage() {
       </div>
       <DeliveryBoysSettings />
       <CloudSettings />
+      <OfficePcs />
       <DeviceInfo />
     </div>
   );
@@ -235,6 +236,53 @@ function SmallButton(props: { label: string; text?: string; onClick: () => void;
       {props.children}
       {props.text}
     </button>
+  );
+}
+
+/** Sharing between PCs needs v1.5.0 or newer on every PC. */
+const SHARING_SINCE = [1, 5, 0];
+const tooOld = (v: string | null) => {
+  if (!v) return true;
+  const parts = v.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((parts[i] ?? 0) !== SHARING_SINCE[i]) return (parts[i] ?? 0) < SHARING_SINCE[i];
+  return false;
+};
+
+function OfficePcs() {
+  const { data: info } = useQuery<AppInfoDTO>("app_info");
+  const { data: pcs } = useQuery<OfficePcDTO[]>("list_office_pcs", {}, 30_000);
+  if (!info) return null;
+  return (
+    <Card title="Office PCs" icon={Network} aside={info.cloudConfigured && pcs && <span className="text-sm text-slate-500">{pcs.length} PC{pcs.length === 1 ? "" : "s"}</span>}>
+      <p className="border-b border-slate-100 px-4 py-3 text-sm text-slate-600">
+        Every PC using the same cloud database works on <b>one shared register</b>: entries, products, delivery boys and day end
+        stay the same on all of them, within a few seconds. To add a PC, install HPCL Operator on it and enter the same details
+        under <b>Cloud Database</b>.
+      </p>
+      {!info.cloudConfigured ? (
+        <p className="px-4 py-4 text-sm text-slate-400">Set up the Cloud Database above to share this register with other PCs.</p>
+      ) : (
+        <ul className="divide-y divide-slate-100 text-sm">
+          {pcs?.map((pc) => (
+            <li key={pc.machineId} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5">
+              <Monitor className="h-4 w-4 text-slate-400" />
+              <span className="font-medium text-slate-800">{pc.deviceName}</span>
+              {pc.isThisPc && <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold uppercase text-hp-blue">This PC</span>}
+              <code className="font-mono text-xs text-slate-400">{pc.machineId}</code>
+              <span className="ml-auto text-slate-500">
+                {pc.appVersion ? `v${pc.appVersion}` : ""}
+                {pc.lastSeenAt && !pc.isThisPc ? ` · last online ${formatDateTime(pc.lastSeenAt)}` : ""}
+              </span>
+              {!pc.isThisPc && tooOld(pc.appVersion) && (
+                <span className="w-full pl-7 text-xs font-medium text-amber-700">
+                  Update this PC to version 1.5 or newer, or it won&apos;t receive the other PCs&apos; entries.
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
   );
 }
 

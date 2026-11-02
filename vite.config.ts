@@ -13,7 +13,8 @@ export default defineConfig({
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**"] },
     // Browser-only development: `npm run bridge` serves the same Rust backend over HTTP.
-    proxy: { "/bridge": "http://127.0.0.1:1430" },
+    // HPCL_BRIDGE_PORT: a second bridge, to try two office PCs on one computer.
+    proxy: { "/bridge": `http://127.0.0.1:${process.env.HPCL_BRIDGE_PORT ?? "1430"}` },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   // Windows 7 runs the last WebView2 that supports it (109, Chromium 109): lightningcss rewrites

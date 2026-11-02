@@ -1,4 +1,6 @@
+import { useEffect, useRef } from "react";
 import { Cloud, CloudOff, HardDrive, Loader2, TriangleAlert } from "lucide-react";
+import { notifyDataChanged } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
 import type { SyncStatusDTO } from "@/lib/types";
@@ -6,6 +8,14 @@ import type { SyncStatusDTO } from "@/lib/types";
 /** Header pill: is everything entered on this PC also in the cloud yet? */
 export function SyncBadge() {
   const { data: s } = useQuery<SyncStatusDTO>("sync_status", {}, 1500);
+  // Another PC of the office changed something: every open screen reloads.
+  const seen = useRef<number | null>(null);
+  const remote = s?.remoteChanges;
+  useEffect(() => {
+    if (remote === undefined) return;
+    if (seen.current !== null && remote !== seen.current) notifyDataChanged();
+    seen.current = remote;
+  }, [remote]);
   if (!s) return <div className="h-7 w-28 animate-pulse rounded-md bg-white/10" />;
 
   const pending = s.pending > 0 ? `${s.pending} waiting` : null;

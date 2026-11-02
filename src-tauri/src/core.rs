@@ -25,18 +25,22 @@ impl Core {
     /// Opens (or creates) `operator.db` in `data_dir` and reads the cloud settings from `config_dir`.
     pub fn open(data_dir: &Path, config_dir: &Path) -> R<Arc<Core>> {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("Cannot create {}: {e}", data_dir.display()))?;
-        let conn = db::open(&data_dir.join("operator.db")).map_err(db_err)?;
+        let mut conn = db::open(&data_dir.join("operator.db")).map_err(db_err)?;
         let machine_id = machine_id(&conn).map_err(db_err)?;
         let config = cloud_config::load(config_dir);
         let info = AppInfo {
             machine_id,
-            device_name: gethostname::gethostname().to_string_lossy().into_owned(),
+            device_name: device_name(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             retention_days: time::RETENTION_DAYS,
             cloud_configured: false,
             cloud_database: None,
             data_dir: data_dir.display().to_string(),
         };
+        // This PC is always in its own office list, online or not.
+        let tx = conn.transaction().map_err(db_err)?;
+        store::apply_remote_machine(&tx, &info.machine_id, &info.device_name, Some(&info.app_version), Some(&time::now_iso()))?;
+        tx.commit().map_err(db_err)?;
         Ok(Arc::new(Core { db: Mutex::new(conn), info, sync: SyncShared::new(config), config_dir: config_dir.to_path_buf() }))
     }
 
@@ -47,10 +51,25 @@ impl Core {
     }
 }
 
+fn device_name() -> String {
+    // Development only: name the simulated office PCs.
+    #[cfg(feature = "dev-bridge")]
+    if let Ok(name) = std::env::var("HPCL_DEVICE_NAME") {
+        return name;
+    }
+    gethostname::gethostname().to_string_lossy().into_owned()
+}
+
 /// A stable ID for this installation, derived from the Windows machine GUID (so reinstalling
 /// on the same PC keeps the same ID and can restore its data) and stored in the database.
 fn machine_id(conn: &Connection) -> rusqlite::Result<String> {
     if let Some(id) = db::meta_get(conn, "machine_id")? {
+        return Ok(id);
+    }
+    // Development only: simulate several office PCs on one computer.
+    #[cfg(feature = "dev-bridge")]
+    if let Ok(id) = std::env::var("HPCL_MACHINE_ID") {
+        db::meta_set(conn, "machine_id", &id)?;
         return Ok(id);
     }
     let seed = machine_uid::get()
@@ -133,6 +152,7 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
             out(cloud_config::describe(core.sync.config().as_ref()))
         }
         "sync_status" => out(cloud::status(core)),
+        "list_office_pcs" => out(core.with_db(|c| store::office_pcs(c))?),
         "sync_now" => {
             core.sync.notify.notify_one();
             Ok(Value::Null)

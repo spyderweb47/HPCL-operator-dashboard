@@ -69,6 +69,40 @@ CREATE INDEX day_end_logs_pending  ON day_end_logs  (id) WHERE version > synced_
 "#, r#"
 -- v1.4: how the money was paid. Existing entries were all cash.
 ALTER TABLE transactions ADD COLUMN payment_mode TEXT NOT NULL DEFAULT 'CASH' CHECK (payment_mode IN ('CASH', 'ONLINE', 'SYSTEM'));
+"#, r#"
+-- v1.5: several PCs in one office share data through the same cloud database.
+
+-- Two PCs may add the same delivery boy while offline, so names are no longer UNIQUE in the
+-- database (the app still refuses duplicates when adding on one PC).
+CREATE TABLE delivery_boys_v5 (
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL COLLATE NOCASE,
+  is_active      INTEGER NOT NULL DEFAULT 1,
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  version        INTEGER NOT NULL DEFAULT 1,
+  synced_version INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO delivery_boys_v5 SELECT id, name, is_active, created_at, updated_at, version, synced_version FROM delivery_boys;
+DROP TABLE delivery_boys;
+ALTER TABLE delivery_boys_v5 RENAME TO delivery_boys;
+CREATE INDEX delivery_boys_pending ON delivery_boys (id) WHERE version > synced_version;
+CREATE INDEX delivery_boys_by_name ON delivery_boys (name);
+
+-- Which PC made the entry (machine ID). NULL = this PC, before v1.5.
+ALTER TABLE transactions ADD COLUMN created_by TEXT;
+
+-- Day End is merged cell by cell between PCs: when each count was last typed, {"cell": iso}.
+-- NULL = saved before v1.5 (every cell counts as changed at updated_at).
+ALTER TABLE day_end_logs ADD COLUMN stamps TEXT;
+
+-- The office's PCs, as last reported to the cloud.
+CREATE TABLE machines (
+  id           TEXT PRIMARY KEY,
+  device_name  TEXT NOT NULL,
+  app_version  TEXT,
+  last_seen_at TEXT
+);
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

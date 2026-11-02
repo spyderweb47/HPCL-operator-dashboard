@@ -38,6 +38,10 @@ pub struct TransactionDTO {
     pub is_other_product: bool,
     /// "CASH" | "ONLINE" | "SYSTEM"
     pub payment_mode: String,
+    /// Machine ID of the PC that made the entry.
+    pub created_by: Option<String>,
+    /// That PC's name, when known.
+    pub created_by_name: Option<String>,
     pub status: String,
     pub is_day_finalized: bool,
     pub created_at: String,
@@ -45,7 +49,7 @@ pub struct TransactionDTO {
     pub synced: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryDTO {
     pub delivery_boy_id: String,
@@ -54,20 +58,20 @@ pub struct DeliveryDTO {
     pub cylinders_delivered: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct StockPair {
     pub full: i64,
     pub empty: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CylinderStock {
     pub kg5: StockPair,
     pub kg14: StockPair,
     pub kg19: StockPair,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DayEndDTO {
     pub date_string: String,
@@ -141,4 +145,16 @@ pub struct SyncStatusDTO {
     pub pending: i64,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,
+    /// Goes up each time changes from the office's other PCs arrive, so open screens reload.
+    pub remote_changes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficePcDTO {
+    pub machine_id: String,
+    pub device_name: String,
+    pub app_version: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub is_this_pc: bool,
 }

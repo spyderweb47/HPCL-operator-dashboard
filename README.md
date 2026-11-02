@@ -6,6 +6,7 @@ in real time whenever the internet is available.
 
 - **No login.** Each installation is identified by its **Machine ID** (shown in Settings). Every record in the cloud carries it.
 - **Same UI** as the web version: same keyboard flow, same rules (6-digit consumer number, Other product, ghost price, soft delete with audit, finalize lock).
+- **Several PCs, one office.** Every PC set to the same cloud database shares one register, product catalog, delivery boys and day end, updated within a few seconds. See [Several PCs in one office](#several-pcs-in-one-office).
 - **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online or system entries.
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
 
@@ -19,10 +20,10 @@ in real time whenever the internet is available.
 
 | Situation | What happens |
 | --- | --- |
-| Internet on | Each save wakes the sync worker; the entry is in the cloud within about 0.3 s. A 30 s check keeps the status pill accurate. |
+| Internet on | Each save wakes the sync worker; the entry is in the cloud within about 0.3 s. Every 4 s it also downloads what the office's other PCs changed. |
 | Internet off | Saving, editing, day end and history keep working from the local file. Changes queue up; the header shows `Offline · N waiting`, and each waiting row has a small upload icon. |
 | Internet back | The worker retries every 5 → 30 s, and also right away after any new entry. It uploads the queue in batches of 200 with 8 uploads in parallel. |
-| Fresh install on the same PC | The Machine ID comes from the Windows machine GUID, so a reinstall gets the same ID. On first connect, it restores this PC's delivery boys, product catalog and the last 180 days from the cloud. |
+| Fresh install, or a new PC in the office | On first connect it downloads the office's delivery boys, product catalog and the last 180 days from the cloud. (The Machine ID comes from the Windows machine GUID, so a reinstall keeps its ID.) |
 | Looking back in time | History reads the last **180 days** from this PC, so it works offline. Older days load from the cloud when online. |
 
 **Keeping the PC light.** Once a day is older than 180 days *and* already in the cloud, it's removed from the PC (checked every 6 hours) and the space is returned to Windows. Unsynced rows are never removed. If cloud sync isn't set up at all, nothing is ever removed.
@@ -34,6 +35,27 @@ For scale: 200 entries a day for 180 days is about 36,000 rows, roughly 15–20 
 - A row edited while it's uploading keeps its newer version and goes up in the next round.
 
 The local file is `%APPDATA%\com.hpcl.operator\operator.db`: SQLite in WAL mode. Only one copy of the app can run at a time; opening it again focuses the existing window.
+
+## Several PCs in one office
+
+All PCs that use the **same cloud database** are one office. They work on one shared register:
+entries, edits and deletes, the product catalog (ghost prices), delivery boys and the Day End counts.
+
+**Adding a PC:** install HPCL Operator on it, open **Settings → Cloud Database** and enter the same details
+as on the first PC. Within a few seconds it has the office's last 180 days. **Settings → Office PCs** lists every
+PC and when it was last online. All PCs need version 1.5 or newer; the list warns about older ones.
+
+| Situation | What happens |
+| --- | --- |
+| Entry made on one PC | Appears on the others within about 5 s, without reloading. When the register has entries from more than one PC, each row shows the PC's name under the time. |
+| Same entry edited on two PCs | The later edit wins on every PC (by the time of the edit). The audit trail is kept. |
+| Day End filled on two PCs | Merged **count by count**: each box keeps the number typed last, wherever it was typed, so two people can fill different rows at the same time. A form open on one PC updates with the other PC's numbers as they arrive. |
+| Finalize on one PC | Locks the day on every PC. Entries that a PC made offline before it heard about the finalize are still kept and counted. |
+| One PC offline | It keeps working from its own file. When it reconnects, it uploads its changes and downloads the others'. |
+| Same delivery boy added on two PCs while offline | Both show up; deactivate one in Settings. |
+
+How it works: each upload is stamped by the database server (`syncedAt`), and each PC downloads everything
+stamped after its last look (with a 30 s overlap), so different PC clocks never cause a missed change.
 
 ## Setting the cloud database
 
@@ -60,6 +82,7 @@ The settings are saved only on this PC, in `%APPDATA%\com.hpcl.operator\cloud.js
 ## Cloud data structure (for the Owner/Admin dashboard)
 
 Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the business day (`YYYY-MM-DD`, India time).
+`syncedAt` is set by the database server when the document was last written (v1.5+; the uploading PC's clock before).
 
 **`machines`**: one document per installed PC, updated on every sync and at least every 5 minutes while online.
 ```js
@@ -75,24 +98,27 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
   status: "ACTIVE" | "EDITED" | "DELETED", isDayFinalized: false,
   auditLog: [{ action: "CREATED"|"UPDATED"|"DELETED", previousProductName, newProductName, previousPrice, newPrice,
                previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, timestamp: Date }],
-  createdAt: Date, updatedAt: Date, syncedAt: Date }
+  createdAt: Date, updatedAt: Date, syncedAt: Date,
+  updatedBy: "machine id" }   // machineId = the PC that made the entry; updatedBy = the PC that changed it last
 ```
-Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`.
+Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`, `{syncedAt, _id}`.
 
-**`dayendlogs`**: one per machine per day. Unique index: `{machineId, dateString}`.
+**`dayendlogs`**: one copy per PC per day (unique index `{machineId, dateString}`). The PCs merge their copies
+count by count, so once synced every copy of a day holds the same numbers; read any one, or merge by the newest `stamps.at` per cell.
 ```js
 { machineId, dateString, localId: "uuid",
   deliveries: [{ deliveryBoyId: "uuid", deliveryBoyName: "Suresh Patil", billsPrinted: 12, cylindersDelivered: 11 }],
   cylinderStock: { kg5: { full, empty }, kg14: { full, empty }, kg19: { full, empty } },
-  isFinalized: true, finalizedAt: Date | null, createdAt: Date, updatedAt: Date, syncedAt: Date }
+  isFinalized: true, finalizedAt: Date | null, createdAt: Date, updatedAt: Date, syncedAt: Date,
+  stamps: [{ cell: "bills:<deliveryBoyId>" | "cyl:<deliveryBoyId>" | "kg14.full" | …, at: Date }] | null }  // when each count was typed (v1.5+)
 ```
 
 **`deliveryboys`**: managed in this app's Settings. Deactivated, never deleted.
 ```js
-{ _id: "uuid", machineId, name: "Suresh Patil", isActive: true, createdAt: Date, updatedAt: Date, syncedAt: Date }
+{ _id: "uuid", machineId, updatedBy, name: "Suresh Patil", isActive: true, createdAt: Date, updatedAt: Date, syncedAt: Date }
 ```
 
-**`products`**: the adaptive catalog (ghost prices). Unique index: `{machineId, nameKey}`.
+**`products`**: the adaptive catalog (ghost prices), one copy per PC. Unique index: `{machineId, nameKey}`. The newest `updatedAt` per `nameKey` is the office's current price.
 ```js
 { machineId, name: "Regulator", nameKey: "regulator", lastUsedPrice: 350.0, localId: "uuid",
   createdAt: Date, updatedAt: Date, syncedAt: Date }
@@ -101,7 +127,8 @@ Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`.
 **Rules for the dashboard:**
 - Treat these collections as **written by the PCs**. If the dashboard edits a document, the PC will overwrite it the next time that row changes locally.
 - Totals exclude `status: "DELETED"`.
-- A day is closed when its `dayendlogs.isFinalized` is true.
+- A day is closed when any of its `dayendlogs` copies has `isFinalized: true`.
+- An office's totals are over all `machineId`s in the database.
 
 ## Keyboard flow
 
@@ -134,7 +161,13 @@ npm run bridge           # backend on :1430 (data in ./.dev-data; set HPCL_MONGO
 npm run dev              # UI on http://localhost:1420
 ```
 
-Tests: `cargo test --manifest-path src-tauri/Cargo.toml --lib` (business rules and pruning), and `npm run typecheck`.
+Two office PCs on one computer: run a second bridge and UI with their own data folder and identity, both with the same `HPCL_MONGODB_URI`/`HPCL_MONGODB_DB`:
+```bash
+HPCL_DATA_DIR=.dev-data-2 HPCL_MACHINE_ID=BBBB-0000-0000-0002 HPCL_DEVICE_NAME=COUNTER-2 HPCL_BRIDGE_PORT=1431 npm run bridge
+HPCL_BRIDGE_PORT=1431 npx vite --port 1421
+```
+
+Tests: `cargo test --manifest-path src-tauri/Cargo.toml --lib` (business rules, two-PC merging, pruning, upgrades), and `npm run typecheck`.
 
 ## Building the Windows installer
 

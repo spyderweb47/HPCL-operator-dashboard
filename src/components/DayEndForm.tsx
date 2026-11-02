@@ -38,15 +38,23 @@ export function DayEndForm({ initial, totals }: Props) {
   const unsaved = useRef<SaveBody | null>(null);
   // Saves run one after another, so an older save can never land after a newer one.
   const queue = useRef<Promise<void>>(Promise.resolve());
+  const saving = useRef(0);
+  // The counts as last loaded or saved. Each save sends them along, so only the cells typed
+  // here are written and counts typed on another PC of the office meanwhile are kept.
+  const baseline = useRef<SaveBody>({ deliveries: initial.deliveries, cylinderStock: initial.cylinderStock });
+  const adopting = useRef(false);
 
   const flush = useCallback(() => {
     const body = unsaved.current;
     if (!body) return queue.current;
     unsaved.current = null;
     setSaveState("saving");
+    saving.current++;
     queue.current = queue.current.then(async () => {
-      const res = await mutate<{ savedAt: string }>("save_day_end", body);
+      const res = await mutate<{ savedAt: string }>("save_day_end", { ...body, base: baseline.current });
+      saving.current--;
       if (res.ok) {
+        baseline.current = body;
         setSavedAt(res.data.savedAt);
         setError(null);
       } else {
@@ -59,7 +67,24 @@ export function DayEndForm({ initial, totals }: Props) {
     return queue.current;
   }, []);
 
+  // Counts saved on another PC show up here as they arrive, unless this PC has unsaved typing
+  // (then they show after the save, which keeps both).
   useEffect(() => {
+    if (unsaved.current || saving.current > 0) return;
+    const server = { deliveries: initial.deliveries, cylinderStock: initial.cylinderStock };
+    baseline.current = server;
+    if (JSON.stringify(server) === JSON.stringify({ deliveries, cylinderStock: stock })) return;
+    adopting.current = true; // not the operator's typing: nothing to save
+    setDeliveries(server.deliveries);
+    setStock(server.cylinderStock);
+    // Only when new data arrives, not on every keystroke.
+  }, [initial]);
+
+  useEffect(() => {
+    if (adopting.current) {
+      adopting.current = false;
+      return;
+    }
     if (!edited.current || initial.isFinalized) return;
     unsaved.current = { deliveries, cylinderStock: stock };
     setSaveState("waiting");
@@ -130,7 +155,7 @@ export function DayEndForm({ initial, totals }: Props) {
       // Finalize saves these same numbers, so drop the waiting auto-save and let any running one finish.
       unsaved.current = null;
       await queue.current;
-      const res = await mutate("finalize_day", { deliveries, cylinderStock: stock });
+      const res = await mutate("finalize_day", { deliveries, cylinderStock: stock, base: baseline.current });
       if (res.ok) {
         setConfirming(false);
       } else {

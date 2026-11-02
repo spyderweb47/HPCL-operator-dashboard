@@ -25,6 +25,9 @@ export type TransactionDTO = {
   consumerNo: string | null;
   isOtherProduct: boolean;
   paymentMode: PaymentMode;
+  /** Machine ID of the PC that made the entry, and that PC's name when known. */
+  createdBy: string | null;
+  createdByName: string | null;
   status: "ACTIVE" | "EDITED" | "DELETED";
   isDayFinalized: boolean;
   createdAt: string;
@@ -86,6 +89,16 @@ export type SyncStatusDTO = {
   pending: number;
   lastSyncAt: string | null;
   lastError: string | null;
+  /** Goes up whenever changes from the office's other PCs arrive. */
+  remoteChanges: number;
+};
+
+export type OfficePcDTO = {
+  machineId: string;
+  deviceName: string;
+  appVersion: string | null;
+  lastSeenAt: string | null;
+  isThisPc: boolean;
 };
 
 export type AppInfoDTO = {
