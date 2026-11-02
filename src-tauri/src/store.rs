@@ -87,6 +87,14 @@ fn parse_consumer_field(v: &Value, is_other: bool) -> R<Option<String>> {
     }
 }
 
+pub const PAYMENT_MODES: [&str; 3] = ["CASH", "ONLINE", "SYSTEM"];
+
+/// Missing/empty -> Cash, the default.
+fn parse_payment_mode(v: Option<&str>) -> R<&'static str> {
+    let v = v.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("CASH");
+    PAYMENT_MODES.into_iter().find(|m| m.eq_ignore_ascii_case(v)).ok_or_else(|| format!("Unknown payment type \"{v}\"."))
+}
+
 /// A non-negative whole count, capped.
 fn count(v: &Value) -> i64 {
     let n = match v {
@@ -106,7 +114,7 @@ fn count(v: &Value) -> i64 {
 // ---------------------------------------------------------------------------------------------
 
 const TX_COLS: &str = "id, date_string, type, product_name, price, consumer_no, is_other_product, status, \
-                       is_day_finalized, created_at, audit_log, version, synced_version";
+                       is_day_finalized, created_at, audit_log, version, synced_version, payment_mode";
 
 fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
     let audit: String = r.get(10)?;
@@ -120,6 +128,7 @@ fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
         price: r.get(4)?,
         consumer_no: r.get(5)?,
         is_other_product: r.get(6)?,
+        payment_mode: r.get(13)?,
         status: r.get(7)?,
         is_day_finalized: r.get(8)?,
         created_at: r.get(9)?,
@@ -180,6 +189,9 @@ pub struct CreateTxInput {
     pub consumer_no: Value,
     #[serde(default)]
     pub is_other_product: bool,
+    /// "CASH" (default) | "ONLINE" | "SYSTEM"
+    #[serde(default)]
+    pub payment_mode: Option<String>,
 }
 
 pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<TransactionDTO> {
@@ -189,6 +201,7 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         return Err("Enter a product / item name.".into());
     }
     let mut price = parse_price(&input.price).map_err(|_| INVALID_PRICE.to_string())?;
+    let payment_mode = parse_payment_mode(input.payment_mode.as_deref())?;
 
     let is_cash_in = kind == "CASH_IN";
     let is_other = is_cash_in && input.is_other_product;
@@ -222,15 +235,16 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         new_product_name: Some(product_name.clone()),
         new_price: Some(price),
         new_consumer_no: consumer_no.clone(),
+        new_payment_mode: Some(payment_mode.into()),
         timestamp: now.clone(),
         ..Default::default()
     }];
     let id = new_id();
     tx.execute(
         "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product,
-                                   status, audit_log, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9)",
-        params![id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now],
+                                   status, audit_log, created_at, updated_at, payment_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10)",
+        params![id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now, payment_mode],
     )
     .map_err(db_err)?;
     let dto = tx
@@ -264,9 +278,9 @@ fn save_change(tx: &Transaction, row: &TransactionDTO, status: &str, entry: Audi
     audit.push(entry);
     tx.execute(
         "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, audit_log = ?6,
-                                 updated_at = ?7, version = version + 1
+                                 updated_at = ?7, payment_mode = ?8, version = version + 1
          WHERE id = ?1",
-        params![row.id, row.product_name, row.price, row.consumer_no, status, serde_json::to_string(&audit).unwrap_or_default(), now],
+        params![row.id, row.product_name, row.price, row.consumer_no, status, serde_json::to_string(&audit).unwrap_or_default(), now, row.payment_mode],
     )
     .map_err(db_err)?;
     Ok(())
@@ -281,6 +295,9 @@ pub struct UpdateTxInput {
     pub price: Value,
     #[serde(default)]
     pub consumer_no: Value,
+    /// Absent = keep the entry's payment type.
+    #[serde(default)]
+    pub payment_mode: Option<String>,
 }
 
 pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> {
@@ -303,7 +320,11 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         }
         consumer_no = parsed;
     }
-    if name == old.product_name && price == old.price && consumer_no == old.consumer_no {
+    let payment_mode = match input.payment_mode.as_deref() {
+        None => old.payment_mode.clone(),
+        v => parse_payment_mode(v)?.to_string(),
+    };
+    if name == old.product_name && price == old.price && consumer_no == old.consumer_no && payment_mode == old.payment_mode {
         return Ok(());
     }
 
@@ -322,9 +343,11 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         new_price: Some(price),
         previous_consumer_no: old.consumer_no.clone(),
         new_consumer_no: consumer_no.clone(),
+        previous_payment_mode: Some(old.payment_mode.clone()),
+        new_payment_mode: Some(payment_mode.clone()),
         timestamp: now.clone(),
     };
-    let new = TransactionDTO { product_name, price, consumer_no, ..old };
+    let new = TransactionDTO { product_name, price, consumer_no, payment_mode, ..old };
     save_change(&tx, &new, "EDITED", entry, &now)?;
     tx.commit().map_err(db_err)
 }
@@ -339,6 +362,7 @@ pub fn delete_transaction(conn: &mut Connection, id: &str) -> R<()> {
         previous_product_name: Some(row.product_name.clone()),
         previous_price: Some(row.price),
         previous_consumer_no: row.consumer_no.clone(),
+        previous_payment_mode: Some(row.payment_mode.clone()),
         timestamp: now.clone(),
         ..Default::default()
     };
@@ -742,6 +766,58 @@ mod tests {
         assert!(cash_in(&mut c, "Regulator", json!(1), "123456").unwrap_err().contains("finalized"));
         assert!(finalize_day(&mut c, serde_json::from_value(input).unwrap()).is_err());
         assert!(transactions_for_date(&c, &time::today()).unwrap()[0].is_day_finalized);
+    }
+
+    #[test]
+    fn payment_modes() {
+        let mut c = mem();
+        let make = |c: &mut Connection, mode: Value| {
+            create_transaction(
+                c,
+                serde_json::from_value(json!({"type":"CASH_IN","productName":"Refill","price":900,"consumerNo":"123456","paymentMode":mode}))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(make(&mut c, json!(null)).unwrap().payment_mode, "CASH");
+        assert_eq!(make(&mut c, json!("online")).unwrap().payment_mode, "ONLINE");
+        assert!(make(&mut c, json!("CHEQUE")).is_err());
+        let t = make(&mut c, json!("SYSTEM")).unwrap();
+        assert_eq!(t.audit_log[0].new_payment_mode.as_deref(), Some("SYSTEM"));
+        let out = create_transaction(
+            &mut c,
+            serde_json::from_value(json!({"type":"CASH_OUT","productName":"Diesel","price":500,"paymentMode":"ONLINE"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out.payment_mode, "ONLINE");
+
+        let update = |c: &mut Connection, body: Value| update_transaction(c, serde_json::from_value(body).unwrap());
+        // Leaving paymentMode out keeps it; changing only the payment type is a real, audited edit.
+        update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456"})).unwrap();
+        update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"CASH"})).unwrap();
+        let row = transactions_for_date(&c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!((row.payment_mode.as_str(), row.price, row.audit_log.len()), ("CASH", 950.0, 3));
+        assert_eq!(row.audit_log[1].new_payment_mode.as_deref(), Some("SYSTEM"));
+        assert_eq!((row.audit_log[2].previous_payment_mode.as_deref(), row.audit_log[2].new_payment_mode.as_deref()), (Some("SYSTEM"), Some("CASH")));
+        assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"bad"})).is_err());
+    }
+
+    #[test]
+    fn upgrade_from_v1_3_database_marks_old_entries_cash() {
+        let path = std::env::temp_dir().join(format!("hpcl-upgrade-{}.db", new_id()));
+        {
+            let mut old = Connection::open(&path).unwrap();
+            let tx = old.transaction().unwrap();
+            tx.execute_batch(crate::db::MIGRATIONS[0]).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.execute(
+                "INSERT INTO transactions (id, date_string, type, product_name, price, created_at, updated_at) VALUES ('a', ?1, 'CASH_IN', 'X', 5, ?1, ?1)",
+                [time::today()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let c = crate::db::open(&path).unwrap();
+        assert_eq!(transactions_for_date(&c, &time::today()).unwrap()[0].payment_mode, "CASH");
     }
 
     #[test]

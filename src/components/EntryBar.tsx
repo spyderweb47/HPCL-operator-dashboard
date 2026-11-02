@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "re
 import { ArrowDownLeft, ArrowUpRight, CheckCircle2, CornerDownLeft, Loader2, Plus, Sparkles } from "lucide-react";
 import { call, mutate } from "@/lib/api";
 import { formatINR } from "@/lib/format";
-import type { ProductSuggestion as Suggestion, TransactionDTO, TransactionType } from "@/lib/types";
+import { PAYMENT_LABEL } from "@/lib/payment";
+import type { PaymentMode, ProductSuggestion as Suggestion, TransactionDTO, TransactionType } from "@/lib/types";
 
 const CONSUMER_NO_DIGITS = 6;
 /** Other products take any text in the Consumer No box (name, phone, note…). */
@@ -14,6 +15,7 @@ export function EntryBar() {
   const [type, setType] = useState<TransactionType>("CASH_IN");
   const [consumerNo, setConsumerNo] = useState("");
   const [isOther, setIsOther] = useState(false);
+  const [payment, setPayment] = useState<PaymentMode>("CASH");
   const [product, setProduct] = useState("");
   const [selected, setSelected] = useState<Suggestion | null>(null);
   const [price, setPrice] = useState("");
@@ -106,10 +108,16 @@ export function EntryBar() {
     if (next && !consumerNo && document.activeElement === consumerRef.current) priceRef.current?.focus();
   };
 
-  // ---- F2 toggles Cash In / Cash Out, F3 toggles "Other product" (Cash In only) ----
-  const hotkeys = useRef({ switchType, toggleOther, isCashIn, isOther });
+  /** Online and System are tick boxes that exclude each other; no tick = Cash. */
+  const togglePayment = (mode: Exclude<PaymentMode, "CASH">) => {
+    setPayment((p) => (p === mode ? "CASH" : mode));
+    setError(null);
+  };
+
+  // ---- F2 toggles Cash In / Cash Out, F3 toggles "Other product" (Cash In only), F4/F6 Online/System ----
+  const hotkeys = useRef({ switchType, toggleOther, togglePayment, isCashIn, isOther });
   useEffect(() => {
-    hotkeys.current = { switchType, toggleOther, isCashIn, isOther };
+    hotkeys.current = { switchType, toggleOther, togglePayment, isCashIn, isOther };
   });
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
@@ -120,6 +128,9 @@ export function EntryBar() {
       } else if (e.key === "F3") {
         e.preventDefault();
         if (h.isCashIn) h.toggleOther(!h.isOther);
+      } else if (e.key === "F4" || e.key === "F6") {
+        e.preventDefault();
+        h.togglePayment(e.key === "F4" ? "ONLINE" : "SYSTEM");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -139,6 +150,7 @@ export function EntryBar() {
     focusAfterRender.current = "product"; // every entry starts at the product
     setConsumerNo("");
     setIsOther(false); // safe default: consumer number required again
+    setPayment("CASH"); // every entry is cash unless ticked
     setProduct("");
     setPrice("");
     setSelected(null);
@@ -178,12 +190,14 @@ export function EntryBar() {
         price: typedPrice || null,
         consumerNo: isCashIn ? consumerNo : null,
         isOtherProduct: isCashIn && isOther,
+        paymentMode: payment,
       });
       if (res.ok) {
         const t = res.data;
         const who =
           t.type === "CASH_OUT" ? "" : t.isOtherProduct ? ` · Other product${t.consumerNo ? ` · ${t.consumerNo}` : ""}` : ` · #${t.consumerNo}`;
-        setFlash(`${t.type === "CASH_IN" ? "Cash In" : "Cash Out"}${who} · ${t.productName} · ${formatINR(t.price)}`);
+        const paid = t.paymentMode && t.paymentMode !== "CASH" ? ` · ${PAYMENT_LABEL[t.paymentMode]}` : "";
+        setFlash(`${t.type === "CASH_IN" ? "Cash In" : "Cash Out"}${who} · ${t.productName} · ${formatINR(t.price)}${paid}`);
         resetForNext();
       } else {
         setError(res.error);
@@ -316,7 +330,7 @@ export function EntryBar() {
         </div>
 
         {/* Product with autocomplete */}
-        <div className="relative min-w-64 flex-1">
+        <div className="relative min-w-48 flex-1">
           <label htmlFor="entry-product" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Product / Item
           </label>
@@ -440,7 +454,7 @@ export function EntryBar() {
         </div>
 
         {/* Price with ghost default */}
-        <div className="w-44">
+        <div className="w-36">
           <label htmlFor="entry-price" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Price (₹)
           </label>
@@ -462,6 +476,12 @@ export function EntryBar() {
               ghost ? "placeholder:text-slate-400 placeholder:italic" : "placeholder:text-slate-300"
             }`}
           />
+        </div>
+
+        {/* Payment: Cash unless Online or System is ticked. Fixed size, like Other product. */}
+        <div className="flex h-[50px] flex-col justify-center gap-1" role="group" aria-label="Payment (Cash unless ticked)">
+          <PaymentTick label="Online" hotkey="F4" checked={payment === "ONLINE"} onToggle={() => togglePayment("ONLINE")} tone="violet" />
+          <PaymentTick label="System" hotkey="F6" checked={payment === "SYSTEM"} onToggle={() => togglePayment("SYSTEM")} tone="orange" />
         </div>
 
         <button
@@ -504,5 +524,27 @@ export function EntryBar() {
         </p>
       </div>
     </section>
+  );
+}
+
+const TICK_TONE = {
+  violet: "border-violet-500 bg-violet-50 text-violet-800 accent-violet-600",
+  orange: "border-orange-500 bg-orange-50 text-orange-800 accent-orange-600",
+};
+
+function PaymentTick(props: { label: string; hotkey: string; checked: boolean; onToggle: () => void; tone: keyof typeof TICK_TONE }) {
+  return (
+    <label
+      // Keep focus in whichever box the operator was typing in; the click only toggles.
+      onMouseDown={(e) => e.preventDefault()}
+      title={`${props.label} payment (${props.hotkey}). Leave both unticked for cash.`}
+      className={`flex cursor-pointer select-none items-center gap-1.5 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-xs font-medium ${
+        props.checked ? TICK_TONE[props.tone] : "border-slate-300 text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      <input type="checkbox" tabIndex={-1} checked={props.checked} onChange={props.onToggle} className="h-3.5 w-3.5 cursor-pointer" />
+      {props.label}
+      <kbd className="ml-auto pl-1 font-mono text-[10px] text-slate-400">{props.hotkey}</kbd>
+    </label>
   );
 }

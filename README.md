@@ -6,6 +6,7 @@ in real time whenever the internet is available.
 
 - **No login.** Each installation is identified by its **Machine ID** (shown in Settings). Every record in the cloud carries it.
 - **Same UI** as the web version: same keyboard flow, same rules (6-digit consumer number, Other product, ghost price, soft delete with audit, finalize lock).
+- **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online or system entries.
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
 
 ## How offline and sync work
@@ -70,9 +71,10 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
 ```js
 { _id: "uuid", machineId, dateString: "2026-10-30", type: "CASH_IN" | "CASH_OUT",
   productName: "Regulator", price: 350.0, consumerNo: "123456" | null, isOtherProduct: false,
+  paymentMode: "CASH" | "ONLINE" | "SYSTEM",   // missing on entries from before v1.4 = "CASH"
   status: "ACTIVE" | "EDITED" | "DELETED", isDayFinalized: false,
   auditLog: [{ action: "CREATED"|"UPDATED"|"DELETED", previousProductName, newProductName, previousPrice, newPrice,
-               previousConsumerNo, newConsumerNo, timestamp: Date }],
+               previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, timestamp: Date }],
   createdAt: Date, updatedAt: Date, syncedAt: Date }
 ```
 Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`.
@@ -106,7 +108,8 @@ Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`.
 | Key | Where | Action |
 | --- | --- | --- |
 | `F2` | anywhere | Switch Cash In / Cash Out (goes back to Cash In after each save) |
-| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number |
+| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text) |
+| `F4` / `F6` | anywhere | Tick or untick **Online** / **System** payment. Neither ticked = Cash; goes back to Cash after each save. |
 | type, `↑`/`↓`, `Tab`/`Enter` | Product | Autocomplete from the catalog, then go to Consumer No (Cash In) or Price |
 | `Esc` | Product | Keep the typed text as a **new item** |
 | `Enter`/`Tab` | Consumer No | Go to Price. Blocked until it's exactly 6 digits (or empty with Other product). |
@@ -114,7 +117,7 @@ Indexes: `{machineId, dateString, createdAt}`, `{dateString}`, `{consumerNo}`.
 | `Esc` | Consumer No / Price | Go back one box |
 | `Enter` / `Esc` | inline row edit | Save / cancel |
 | `Enter` | Day End count cell | Next delivery boy, same column |
-| `Ctrl+S` | Day End | Save progress |
+| `Ctrl+S` | Day End | Save now (it also saves by itself a moment after each change) |
 
 ## Development
 

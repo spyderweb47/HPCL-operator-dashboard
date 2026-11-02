@@ -4,7 +4,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
-const MIGRATIONS: &[&str] = &[r#"
+pub(crate) const MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -66,6 +66,9 @@ CREATE INDEX products_pending      ON products      (id) WHERE version > synced_
 CREATE INDEX delivery_boys_pending ON delivery_boys (id) WHERE version > synced_version;
 CREATE INDEX transactions_pending  ON transactions  (id) WHERE version > synced_version;
 CREATE INDEX day_end_logs_pending  ON day_end_logs  (id) WHERE version > synced_version;
+"#, r#"
+-- v1.4: how the money was paid. Existing entries were all cash.
+ALTER TABLE transactions ADD COLUMN payment_mode TEXT NOT NULL DEFAULT 'CASH' CHECK (payment_mode IN ('CASH', 'ONLINE', 'SYSTEM'));
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

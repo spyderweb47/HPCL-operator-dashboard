@@ -18,6 +18,10 @@ pub struct AuditEntry {
     pub previous_consumer_no: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_consumer_no: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_payment_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_payment_mode: Option<String>,
     pub timestamp: String,
 }
 
@@ -32,6 +36,8 @@ pub struct TransactionDTO {
     pub price: f64,
     pub consumer_no: Option<String>,
     pub is_other_product: bool,
+    /// "CASH" | "ONLINE" | "SYSTEM"
+    pub payment_mode: String,
     pub status: String,
     pub is_day_finalized: bool,
     pub created_at: String,

@@ -1,17 +1,30 @@
-import type { Totals, TransactionDTO } from "./types";
+import type { PaymentMode, Totals, TransactionDTO } from "./types";
+
+// round to paise to avoid float drift in display
+const round = (n: number) => Math.round(n * 100) / 100;
+const zero = (): Record<PaymentMode, number> => ({ CASH: 0, ONLINE: 0, SYSTEM: 0 });
 
 /** Deleted rows are kept for audit but never count toward totals. */
 export function computeTotals(rows: TransactionDTO[]): Totals {
-  let cashIn = 0;
-  let cashOut = 0;
+  const inByMode = zero();
+  const outByMode = zero();
   let count = 0;
   for (const r of rows) {
     if (r.status === "DELETED") continue;
     count++;
-    if (r.type === "CASH_IN") cashIn += r.price;
-    else cashOut += r.price;
+    const mode = r.paymentMode ?? "CASH";
+    if (r.type === "CASH_IN") inByMode[mode] += r.price;
+    else outByMode[mode] += r.price;
   }
-  // round to paise to avoid float drift in display
-  const round = (n: number) => Math.round(n * 100) / 100;
-  return { cashIn: round(cashIn), cashOut: round(cashOut), net: round(cashIn - cashOut), count };
+  const sum = (m: Record<PaymentMode, number>) => m.CASH + m.ONLINE + m.SYSTEM;
+  for (const m of [inByMode, outByMode]) for (const k of Object.keys(m) as PaymentMode[]) m[k] = round(m[k]);
+  return {
+    cashIn: round(sum(inByMode)),
+    cashOut: round(sum(outByMode)),
+    net: round(inByMode.CASH - outByMode.CASH),
+    count,
+    inByMode,
+    outByMode,
+    hasNonCash: [inByMode, outByMode].some((m) => m.ONLINE !== 0 || m.SYSTEM !== 0),
+  };
 }

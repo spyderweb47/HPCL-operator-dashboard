@@ -1,5 +1,8 @@
 export type TransactionType = "CASH_IN" | "CASH_OUT";
 
+/** How the money was paid. Cash unless ticked otherwise. */
+export type PaymentMode = "CASH" | "ONLINE" | "SYSTEM";
+
 export type AuditEntryDTO = {
   action: "CREATED" | "UPDATED" | "DELETED";
   previousProductName?: string;
@@ -8,6 +11,8 @@ export type AuditEntryDTO = {
   newPrice?: number;
   previousConsumerNo?: string;
   newConsumerNo?: string;
+  previousPaymentMode?: PaymentMode;
+  newPaymentMode?: PaymentMode;
   timestamp: string;
 };
 
@@ -19,6 +24,7 @@ export type TransactionDTO = {
   price: number;
   consumerNo: string | null;
   isOtherProduct: boolean;
+  paymentMode: PaymentMode;
   status: "ACTIVE" | "EDITED" | "DELETED";
   isDayFinalized: boolean;
   createdAt: string;
@@ -94,7 +100,18 @@ export type AppInfoDTO = {
 
 export type ActionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string };
 
-export type Totals = { cashIn: number; cashOut: number; net: number; count: number };
+export type Totals = {
+  /** All Cash In / Cash Out entries, whatever the payment type. */
+  cashIn: number;
+  cashOut: number;
+  /** Money in the drawer: cash-paid entries only. */
+  net: number;
+  count: number;
+  inByMode: Record<PaymentMode, number>;
+  outByMode: Record<PaymentMode, number>;
+  /** Any Online/System entries? (otherwise the totals look exactly as before) */
+  hasNonCash: boolean;
+};
 
 /** Saved cloud settings, as safe to show: never contains the password. */
 export type CloudSettingsDTO = {

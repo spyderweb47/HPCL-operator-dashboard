@@ -3,7 +3,8 @@ import { Check, CloudUpload, Eye, EyeOff, Loader2, Pencil, Trash2, X } from "luc
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
-import type { AuditEntryDTO, TransactionDTO } from "@/lib/types";
+import { PAYMENT_LABEL, PAYMENT_MODES, PAYMENT_TAG } from "@/lib/payment";
+import type { AuditEntryDTO, PaymentMode, TransactionDTO } from "@/lib/types";
 
 type Props = {
   rows: TransactionDTO[];
@@ -12,13 +13,17 @@ type Props = {
 };
 
 const cn = (n?: string) => (n ? ` #${n}` : "");
+const paid = (m?: PaymentMode) => (m && m !== "CASH" ? ` · ${PAYMENT_LABEL[m]}` : "");
 const CONSUMER_NO_DIGITS = 6;
 const OTHER_NOTE_MAX = 60;
 
 function describeAudit(a: AuditEntryDTO) {
   const when = formatDateTime(a.timestamp);
-  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}`;
-  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}`;
+  // Payment type is shown when it isn't cash, and on both sides whenever an edit changed it.
+  const modeChanged = a.previousPaymentMode && a.newPaymentMode && a.previousPaymentMode !== a.newPaymentMode;
+  const pm = (m?: PaymentMode) => (modeChanged ? ` · ${PAYMENT_LABEL[m ?? "CASH"]}` : paid(m));
+  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}${pm(a.previousPaymentMode)}`;
+  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}${pm(a.newPaymentMode)}`;
   if (a.action === "CREATED") return `${when} · Created: ${next}`;
   if (a.action === "DELETED") return `${when} · Deleted (was ${prev})`;
   return `${when} · Edited: ${prev} → ${next}`;
@@ -29,6 +34,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const [draftName, setDraftName] = useState("");
   const [draftPrice, setDraftPrice] = useState("");
   const [draftConsumer, setDraftConsumer] = useState("");
+  const [draftPayment, setDraftPayment] = useState<PaymentMode>("CASH");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDeleted, setShowDeleted] = useState(true);
@@ -42,6 +48,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
     setDraftName(r.productName);
     setDraftPrice(String(r.price));
     setDraftConsumer(r.consumerNo ?? "");
+    setDraftPayment(r.paymentMode ?? "CASH");
     setError(null);
   };
 
@@ -53,7 +60,13 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const saveEdit = (id: string) => {
     setBusyId(id);
     startTransition(async () => {
-      const res = await mutate("update_transaction", { id, productName: draftName, price: draftPrice, consumerNo: draftConsumer });
+      const res = await mutate("update_transaction", {
+        id,
+        productName: draftName,
+        price: draftPrice,
+        consumerNo: draftConsumer,
+        paymentMode: draftPayment,
+      });
       setBusyId(null);
       if (res.ok) {
         setEditingId(null);
@@ -73,7 +86,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
     });
   };
 
-  const onEditKeyDown = (e: KeyboardEvent<HTMLInputElement>, id: string) => {
+  const onEditKeyDown = (e: KeyboardEvent<HTMLElement>, id: string) => {
     if (e.key === "Enter") {
       e.preventDefault();
       saveEdit(id);
@@ -113,7 +126,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
             <tr>
               <th className="w-12 px-4 py-2">#</th>
               <th className="w-24 px-2 py-2">Time</th>
-              <th className="w-28 px-2 py-2">Type</th>
+              <th className="w-36 px-2 py-2">Type</th>
               <th className="w-32 px-2 py-2">Consumer No</th>
               <th className="px-2 py-2">Product / Item</th>
               <th className="w-36 px-2 py-2 text-right">Amount</th>
@@ -152,7 +165,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
                       )}
                     </span>
                   </td>
-                  <td className="px-2 py-2">
+                  <td className="whitespace-nowrap px-2 py-2">
                     <span
                       className={`rounded px-2 py-0.5 text-xs font-bold ${
                         deleted ? "bg-slate-200 text-slate-500" : cashIn ? "bg-emerald-100 text-emerald-800" : "bg-rose-100 text-rose-800"
@@ -160,6 +173,33 @@ export function RegisterTable({ rows, editable, title }: Props) {
                     >
                       {cashIn ? "CASH IN" : "CASH OUT"}
                     </span>
+                    {editing ? (
+                      <select
+                        aria-label="Payment"
+                        value={draftPayment}
+                        onChange={(e) => setDraftPayment(e.target.value as PaymentMode)}
+                        onKeyDown={(e) => onEditKeyDown(e, r.id)}
+                        className="mt-1 block w-full rounded border border-slate-300 bg-white px-1 py-0.5 text-xs outline-none focus:border-hp-blue"
+                      >
+                        {PAYMENT_MODES.map((m) => (
+                          <option key={m} value={m}>
+                            {PAYMENT_LABEL[m]}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      r.paymentMode &&
+                      r.paymentMode !== "CASH" && (
+                        <span
+                          title={`Paid ${PAYMENT_LABEL[r.paymentMode].toLowerCase()}: not counted in Net Cash`}
+                          className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                            deleted ? "bg-slate-200 text-slate-500" : PAYMENT_TAG[r.paymentMode]
+                          }`}
+                        >
+                          {PAYMENT_LABEL[r.paymentMode]}
+                        </span>
+                      )
+                    )}
                   </td>
                   <td className="tabular max-w-40 px-2 py-2">
                     {editing && cashIn ? (

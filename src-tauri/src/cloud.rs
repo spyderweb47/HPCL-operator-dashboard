@@ -374,6 +374,8 @@ fn audit_doc(a: &AuditEntry) -> Document {
     put_s("newProductName", &a.new_product_name);
     put_s("previousConsumerNo", &a.previous_consumer_no);
     put_s("newConsumerNo", &a.new_consumer_no);
+    put_s("previousPaymentMode", &a.previous_payment_mode);
+    put_s("newPaymentMode", &a.new_payment_mode);
     if let Some(p) = a.previous_price {
         d.insert("previousPrice", p);
     }
@@ -491,7 +493,7 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT id, date_string, type, product_name, price, consumer_no, is_other_product, status, is_day_finalized,
-                    audit_log, created_at, updated_at, version
+                    audit_log, created_at, updated_at, version, payment_mode
              FROM transactions WHERE version > synced_version ORDER BY created_at LIMIT ?1",
         )
         .map_err(db_err)?;
@@ -512,6 +514,7 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "price": r.get::<_, f64>(4)?,
                     "consumerNo": opt_str(&r.get(5)?),
                     "isOtherProduct": r.get::<_, bool>(6)?,
+                    "paymentMode": r.get::<_, String>(13)?,
                     "status": r.get::<_, String>(7)?,
                     "isDayFinalized": r.get::<_, bool>(8)?,
                     "auditLog": audit.iter().map(audit_doc).collect::<Vec<_>>(),
@@ -634,6 +637,8 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
                     new_price: e.contains_key("newPrice").then(|| num(e, "newPrice")),
                     previous_consumer_no: opt_s(e, "previousConsumerNo"),
                     new_consumer_no: opt_s(e, "newConsumerNo"),
+                    previous_payment_mode: opt_s(e, "previousPaymentMode"),
+                    new_payment_mode: opt_s(e, "newPaymentMode"),
                     timestamp: iso(e, "timestamp").unwrap_or_default(),
                 })
                 .collect()
@@ -647,6 +652,10 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
         price: num(d, "price"),
         consumer_no: opt_s(d, "consumerNo"),
         is_other_product: flag(d, "isOtherProduct"),
+        // Entries uploaded before payment types existed were all cash.
+        payment_mode: opt_s(d, "paymentMode")
+            .filter(|m| store::PAYMENT_MODES.contains(&m.as_str()))
+            .unwrap_or_else(|| "CASH".into()),
         status: opt_s(d, "status").unwrap_or_else(|| "ACTIVE".into()),
         is_day_finalized: flag(d, "isDayFinalized"),
         created_at: iso(d, "createdAt").unwrap_or_default(),
@@ -730,12 +739,12 @@ async fn restore(core: &Core, db: &Database) -> Result<(), SyncError> {
             n += tx
                 .execute(
                     "INSERT OR IGNORE INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product,
-                        status, is_day_finalized, audit_log, created_at, updated_at, version, synced_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, 1)",
+                        status, is_day_finalized, audit_log, created_at, updated_at, version, synced_version, payment_mode)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, 1, ?13)",
                     params![
                         t.id, t.date_string, t.kind, t.product_name, t.price, t.consumer_no, t.is_other_product, t.status,
                         t.is_day_finalized, serde_json::to_string(&t.audit_log).unwrap_or_default(), t.created_at,
-                        iso(d, "updatedAt").unwrap_or_else(|| t.created_at.clone())
+                        iso(d, "updatedAt").unwrap_or_else(|| t.created_at.clone()), t.payment_mode
                     ],
                 )
                 .map_err(db_err)?;

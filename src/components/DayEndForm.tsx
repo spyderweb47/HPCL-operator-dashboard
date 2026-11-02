@@ -4,6 +4,7 @@ import { AlertTriangle, Bike, Check, CheckCircle2, Cylinder, Loader2, Lock } fro
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatLongDate, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
+import { PAYMENT_LABEL } from "@/lib/payment";
 import type { CylinderStockDTO, DayEndDTO, DeliveryDTO, Totals } from "@/lib/types";
 import { Card, DeliveriesView, STOCK_ROWS, StockView } from "./DayEndViews";
 
@@ -314,11 +315,17 @@ function ConfirmFinalize(props: {
     return () => window.removeEventListener("keydown", onKey);
   }, [onCancel, pending]);
 
+  const t = props.totals;
+  // Online/System money never passes through the drawer: listed on their own, only when used.
+  const received = (m: "ONLINE" | "SYSTEM") => t.inByMode[m] - t.outByMode[m];
   const rows = [
-    ["Cash In", formatINR(props.totals.cashIn)],
-    ["Cash Out", formatINR(props.totals.cashOut)],
-    ["Net Cash", formatINR(props.totals.net)],
-    ["Active entries", String(props.totals.count)],
+    ["Cash In", formatINR(t.cashIn)],
+    ["Cash Out", formatINR(t.cashOut)],
+    [t.hasNonCash ? "Net Cash (in drawer)" : "Net Cash", formatINR(t.net)],
+    ...(["ONLINE", "SYSTEM"] as const)
+      .filter((m) => t.inByMode[m] || t.outByMode[m])
+      .map((m) => [`${PAYMENT_LABEL[m]} (in − out)`, formatINR(received(m))]),
+    ["Active entries", String(t.count)],
     ["Delivery boys with counts", String(props.deliveries)],
     ["Bills printed / Delivered", `${props.totalBills} / ${props.totalCyl}`],
   ];
