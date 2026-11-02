@@ -139,6 +139,11 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
             let cfg = cloud_config::compose(&input, core.sync.config().as_ref())?;
             out(cloud::test_connection(&cfg).await?)
         }
+        "check_cloud_switch" => {
+            let input: CloudInput = arg(args)?;
+            let cfg = cloud_config::compose(&input, core.sync.config().as_ref())?;
+            core.with_db(|c| cloud::switch_check(c, &cfg))
+        }
         "save_cloud_settings" => {
             let input: CloudInput = arg(args)?;
             let cfg = cloud_config::compose(&input, core.sync.config().as_ref())?;

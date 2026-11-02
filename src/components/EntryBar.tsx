@@ -375,7 +375,7 @@ export function EntryBar() {
         </div>
 
         {/* Role: the Office, or the delivery boy the entry is for */}
-        <div className="w-32">
+        <div className="w-24">
           <label htmlFor="entry-role" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Role
           </label>

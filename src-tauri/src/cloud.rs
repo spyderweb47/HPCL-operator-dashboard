@@ -256,21 +256,43 @@ async fn cycle(core: &Arc<Core>, cfg: &CloudConfig, gen: u64, timers: &mut Timer
     Ok(())
 }
 
-/// First connection to a different cluster/database: upload everything on this PC there, and
-/// download everything the office's PCs already have there.
+/// Which database this PC's data belongs to. The first time a PC connects anywhere, what it already
+/// has (e.g. from working offline) is uploaded there. Switching to a different cluster/database
+/// starts fresh instead: the local copy is cleared and that database's data is downloaded, so data
+/// never leaks from one database into another. Settings warns before discarding changes that the
+/// previous database hadn't received yet.
 fn retarget(conn: &mut Connection, key: &str) -> R<()> {
-    if db::meta_get(conn, "cloud_target").map_err(db_err)?.as_deref() == Some(key) {
+    let current = db::meta_get(conn, "cloud_target").map_err(db_err)?;
+    if current.as_deref() == Some(key) {
         return Ok(());
     }
     let tx = conn.transaction().map_err(db_err)?;
-    for table in ["transactions", "day_end_logs", "products", "delivery_boys"] {
-        tx.execute(&format!("UPDATE {table} SET synced_version = 0"), []).map_err(db_err)?;
+    if current.is_none() {
+        for table in ["transactions", "day_end_logs", "products", "delivery_boys"] {
+            tx.execute(&format!("UPDATE {table} SET synced_version = 0"), []).map_err(db_err)?;
+        }
+        eprintln!("[sync] first cloud target {key}: uploading local data");
+    } else {
+        for table in ["transactions", "day_end_logs", "products", "delivery_boys", "machines"] {
+            tx.execute(&format!("DELETE FROM {table}"), []).map_err(db_err)?;
+        }
+        eprintln!("[sync] switched cloud target to {key}: downloading its data fresh");
     }
     tx.execute("DELETE FROM meta WHERE key = 'restore_done' OR key LIKE 'pull_cursor:%'", []).map_err(db_err)?;
     db::meta_set(&tx, "cloud_target", key).map_err(db_err)?;
     tx.commit().map_err(db_err)?;
-    eprintln!("[sync] new cloud target {key}: re-uploading local data");
     Ok(())
+}
+
+/// Before saving new cloud settings: would they switch this PC to a different database, and how
+/// many local changes has the current one not received yet (those are discarded by the switch)?
+pub fn switch_check(conn: &Connection, cfg: &CloudConfig) -> R<serde_json::Value> {
+    let current = db::meta_get(conn, "cloud_target").map_err(db_err)?;
+    let switching = current.as_ref().is_some_and(|c| *c != cloud_config::target_key(cfg));
+    Ok(serde_json::json!({
+        "switching": switching,
+        "pending": if switching { store::pending_count(conn)? } else { 0 },
+    }))
 }
 
 /// Settings → "Test connection": connect, log in and read the database, without saving anything.

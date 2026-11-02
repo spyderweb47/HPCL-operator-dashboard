@@ -47,6 +47,23 @@ export function CloudSettings() {
   const save = async (e: FormEvent) => {
     e.preventDefault();
     setBusy("save");
+    // A different cluster or database: this PC will show only that database's data, downloaded fresh.
+    try {
+      const check = await call<{ switching: boolean; pending: number }>("check_cloud_switch", form);
+      if (check.switching) {
+        const lost =
+          check.pending > 0
+            ? `\n\n⚠ ${check.pending} change${check.pending === 1 ? "" : "s"} on this PC ha${check.pending === 1 ? "s" : "ve"} not reached ${saved?.database ?? "the current database"} yet and will be LOST. Cancel and wait until the status shows Synced to keep ${check.pending === 1 ? "it" : "them"}.`
+            : "";
+        const ok = window.confirm(
+          `Switch this PC to the database "${form.database.trim()}"?\n\nThis PC's register, delivery boys and products will be replaced with the data in that database, downloaded fresh. Nothing from this PC is copied into it. The data in ${saved?.database ?? "the current database"} stays in the cloud, untouched.${lost}`,
+        );
+        if (!ok) return setBusy(null);
+      }
+    } catch (err) {
+      setBusy(null);
+      return setResult({ ok: false, text: typeof err === "string" ? err : "Could not check the new settings." });
+    }
     const res = await mutate<CloudSettingsDTO>("save_cloud_settings", form);
     setBusy(null);
     setResult(
@@ -189,8 +206,8 @@ export function CloudSettings() {
         ) : (
           <p className="text-xs text-slate-400">
             {keepsPassword ? "The saved password is kept unless you type a new one. " : ""}
-            Changing the cluster or database uploads everything on this PC (last 180 days) to the new one. The connection string
-            is stored only on this PC.
+            Switching to a different cluster or database replaces this PC&apos;s data with that database&apos;s, downloaded fresh;
+            nothing is copied across. The connection string is stored only on this PC.
           </p>
         )}
       </form>

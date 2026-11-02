@@ -44,8 +44,9 @@ All PCs that use the **same cloud database** are one office. They work on one sh
 entries, edits and deletes, the product catalog (ghost prices), delivery boys and the Day End counts.
 
 **Adding a PC:** install HPCL Operator on it, open **Settings → Cloud Database** and enter the same details
-as on the first PC. Within a few seconds it has the office's last 180 days. **Settings → Office PCs** lists every
-PC, the name set on it, and when it was last online. All PCs should run version 1.6 or newer (1.5 shares entries but doesn't show roles or quantities); the list warns about older ones.
+as on the first PC. Within a few seconds it has the office's last 180 days. All PCs should run version 1.6 or newer
+(1.5 shares entries but doesn't show roles or quantities). The office's PCs, with the name set on each, are in the
+cloud's `machines` collection.
 
 | Situation | What happens |
 | --- | --- |
@@ -72,7 +73,8 @@ Nothing is built into the installer. A fresh install runs as **This PC only** un
 It takes effect immediately; no restart is needed.
 
 - **New password:** type it and save; nothing else changes. Leaving Password blank keeps the saved one.
-- **Different cluster or database:** everything on this PC (the last 180 days, delivery boys and catalog) is uploaded to the new one automatically.
+- **Different cluster or database** (e.g. a separate test database): this PC starts fresh. Its local copy is replaced by the new database's data (last 180 days, delivery boys and catalog), downloaded from the cloud; nothing from this PC is copied into the new database, and the old one stays as it was. Settings asks first, and warns if some changes haven't reached the old database yet (those would be lost).
+- **First connection ever** (a PC that worked offline before any cloud was set): what it has is uploaded.
 - **Turn off cloud sync:** the app keeps working on this PC only.
 
 The settings are saved only on this PC, in `%APPDATA%\com.hpcl.operator\cloud.json`. For development, the `HPCL_MONGODB_URI` and `HPCL_MONGODB_DB` environment variables are used when that file doesn't exist.
