@@ -14,6 +14,7 @@ export function DayEndPage() {
       key={`${data.date}-${data.dayEnd.isFinalized}`}
       initial={data.dayEnd}
       totals={computeTotals(data.transactions)}
+      sales={data.sales}
     />
   );
 }

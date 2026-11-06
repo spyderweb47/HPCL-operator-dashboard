@@ -32,6 +32,8 @@ const DAY_END_LOGS: &str = "dayendlogs";
 const PRODUCTS: &str = "products";
 const DELIVERY_BOYS: &str = "deliveryboys";
 const MACHINES: &str = "machines";
+const DELIVERY_SALES: &str = "deliverysales";
+const OFFICE_SETTINGS: &str = "officesettings";
 
 const BATCH: i64 = 200;
 const PARALLEL_UPLOADS: usize = 8;
@@ -268,12 +270,12 @@ fn retarget(conn: &mut Connection, key: &str) -> R<()> {
     }
     let tx = conn.transaction().map_err(db_err)?;
     if current.is_none() {
-        for table in ["transactions", "day_end_logs", "products", "delivery_boys"] {
+        for table in ["transactions", "day_end_logs", "products", "delivery_boys", "delivery_sales", "office_settings"] {
             tx.execute(&format!("UPDATE {table} SET synced_version = 0"), []).map_err(db_err)?;
         }
         eprintln!("[sync] first cloud target {key}: uploading local data");
     } else {
-        for table in ["transactions", "day_end_logs", "products", "delivery_boys", "machines"] {
+        for table in ["transactions", "day_end_logs", "products", "delivery_boys", "delivery_sales", "office_settings", "machines"] {
             tx.execute(&format!("DELETE FROM {table}"), []).map_err(db_err)?;
         }
         eprintln!("[sync] switched cloud target to {key}: downloading its data fresh");
@@ -348,8 +350,15 @@ async fn ensure_indexes(db: &Database) -> mongodb::error::Result<()> {
     db.collection::<Document>(DELIVERY_BOYS)
         .create_index(index(doc! { "machineId": 1, "name": 1 }, false))
         .await?;
+    db.collection::<Document>(DELIVERY_SALES)
+        .create_indexes([
+            index(doc! { "dateString": 1 }, false),
+            index(doc! { "deliveryBoyId": 1, "dateString": 1 }, false),
+            index(doc! { "systemPayments.consumerNo": 1 }, false),
+        ])
+        .await?;
     // "What changed since my last look?"
-    for coll in [TRANSACTIONS, DAY_END_LOGS, PRODUCTS, DELIVERY_BOYS] {
+    for coll in [TRANSACTIONS, DAY_END_LOGS, PRODUCTS, DELIVERY_BOYS, DELIVERY_SALES, OFFICE_SETTINGS] {
         db.collection::<Document>(coll).create_index(index(doc! { "syncedAt": 1, "_id": 1 }, false)).await?;
     }
     Ok(())
@@ -553,6 +562,84 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "updatedAt": date(&r.get::<_, String>(7)?),
                 },
                 version: r.get(8)?,
+                id,
+            })
+        })
+        .map_err(db_err)?;
+    out.extend(rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?);
+
+    // Office settings: one shared document per setting.
+    let mut stmt = conn
+        .prepare_cached("SELECT id, value, updated_by_user, updated_at, version FROM office_settings WHERE version > synced_version LIMIT ?1")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([BATCH], |r| {
+            let id: String = r.get(0)?;
+            Ok(Upload {
+                table: "office_settings",
+                collection: OFFICE_SETTINGS,
+                filter: doc! { "_id": &id },
+                doc: doc! {
+                    "_id": &id,
+                    "value": r.get::<_, String>(1)?,
+                    "updatedBy": machine_id,
+                    "updatedByUser": opt_str(&r.get(2)?),
+                    "updatedAt": date(&r.get::<_, String>(3)?),
+                },
+                version: r.get(4)?,
+                id,
+            })
+        })
+        .map_err(db_err)?;
+    out.extend(rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?);
+
+    // Delivery boy sales: one shared document per delivery boy per day ("<date>:<delivery boy id>").
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, date_string, delivery_boy_id, delivery_boy_name, products, cash, online, system, expenses,
+                    updated_by_user, created_at, updated_at, version, system_payments
+             FROM delivery_sales WHERE version > synced_version ORDER BY updated_at LIMIT ?1",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([BATCH], |r| {
+            let id: String = r.get(0)?;
+            let products: Vec<SoldProduct> = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
+            let expenses: Vec<Expense> = serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default();
+            let system_payments: Vec<SystemPayment> = serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
+            let (cash, online, system): (f64, f64, f64) = (r.get(5)?, r.get(6)?, r.get(7)?);
+            let spent: f64 = expenses.iter().map(|e| e.amount).sum();
+            let paise = |v: f64| (v * 100.0).round() / 100.0;
+            Ok(Upload {
+                table: "delivery_sales",
+                collection: DELIVERY_SALES,
+                filter: doc! { "_id": &id },
+                doc: doc! {
+                    "_id": &id,
+                    "dateString": r.get::<_, String>(1)?,
+                    "deliveryBoyId": r.get::<_, String>(2)?,
+                    "deliveryBoyName": r.get::<_, String>(3)?,
+                    "products": products.iter().map(|p| doc! { "name": &p.name, "quantity": p.quantity }).collect::<Vec<_>>(),
+                    "cash": cash,
+                    "online": online,
+                    "system": system,
+                    // Each system payment: whose (consumer number, optional name) and how much; "system" is their total.
+                    "systemPayments": system_payments
+                        .iter()
+                        .map(|p| doc! { "consumerNo": &p.consumer_no, "name": opt_str(&p.name), "amount": p.amount })
+                        .collect::<Vec<_>>(),
+                    "expenses": expenses.iter().map(|e| doc! { "name": &e.name, "amount": e.amount }).collect::<Vec<_>>(),
+                    // Ready-made totals for the owner's reports. System payments are counted on their own.
+                    "totalReceived": paise(cash + online),
+                    "systemCount": system_payments.len() as i64,
+                    "totalExpenses": paise(spent),
+                    "cashToHandOver": paise(cash - spent),
+                    "updatedBy": machine_id,
+                    "updatedByUser": opt_str(&r.get(9)?),
+                    "createdAt": date(&r.get::<_, String>(10)?),
+                    "updatedAt": date(&r.get::<_, String>(11)?),
+                },
+                version: r.get(12)?,
                 id,
             })
         })
@@ -792,6 +879,29 @@ async fn find_all(db: &Database, coll: &str, filter: Document) -> mongodb::error
     db.collection::<Document>(coll).find(filter).await?.try_collect().await
 }
 
+fn sales_from_doc(d: &Document) -> DeliverySalesDTO {
+    let lines = |k: &str| d.get_array(k).map(|a| a.iter().filter_map(|e| e.as_document()).collect::<Vec<_>>()).unwrap_or_default();
+    DeliverySalesDTO {
+        delivery_boy_id: s(d, "deliveryBoyId"),
+        delivery_boy_name: s(d, "deliveryBoyName"),
+        products: lines("products").into_iter().map(|p| SoldProduct { name: s(p, "name"), quantity: num(p, "quantity") as i64 }).collect(),
+        cash: num(d, "cash"),
+        online: num(d, "online"),
+        system: num(d, "system"),
+        system_payments: lines("systemPayments")
+            .into_iter()
+            .map(|p| SystemPayment { consumer_no: s(p, "consumerNo"), name: opt_s(p, "name"), amount: num(p, "amount") })
+            .collect(),
+        expenses: lines("expenses")
+            .into_iter()
+            .map(|e| Expense { name: s(e, "name"), amount: num(e, "amount") })
+            .collect(),
+        usual_product: None,
+        updated_by_user: opt_s(d, "updatedByUser"),
+        updated_at: iso(d, "updatedAt"),
+    }
+}
+
 fn day_copy_from_doc(d: &Document) -> DayCopy {
     let stamps = match d.get("stamps") {
         Some(Bson::Array(a)) => Some(
@@ -820,6 +930,8 @@ fn apply_docs(conn: &mut Connection, coll: &str, docs: &[Document]) -> R<usize> 
             }
             PRODUCTS => store::apply_remote_product(&tx, &s(d, "name"), num(d, "lastUsedPrice"), &created_at, &updated_at)?,
             DAY_END_LOGS => store::apply_remote_day(&tx, &day_copy_from_doc(d))?,
+            OFFICE_SETTINGS => store::apply_remote_setting(&tx, &doc_id(d, "_id"), &s(d, "value"), opt_s(d, "updatedByUser").as_deref(), &updated_at)?,
+            DELIVERY_SALES => store::apply_remote_sales(&tx, &s(d, "dateString"), &sales_from_doc(d), &created_at, &updated_at)?,
             _ => false,
         };
         changed += did as usize;
@@ -835,7 +947,7 @@ async fn pull_all(core: &Core, db: &Database) -> Result<usize, SyncError> {
     let server_now = hello.get_datetime("localTime").map(|t| t.timestamp_millis()).unwrap_or(i64::MAX);
     let mut changed = 0;
     // Delivery boys first: day-end counts refer to them.
-    for coll in [DELIVERY_BOYS, PRODUCTS, TRANSACTIONS, DAY_END_LOGS] {
+    for coll in [OFFICE_SETTINGS, DELIVERY_BOYS, PRODUCTS, TRANSACTIONS, DAY_END_LOGS, DELIVERY_SALES] {
         changed += pull(core, db, coll, server_now).await?;
     }
     Ok(changed)
@@ -854,7 +966,7 @@ async fn pull(core: &Core, db: &Database, coll: &'static str, server_now: i64) -
             base.insert(by, doc! { "$ne": me });
         }
         // First look (new PC, reinstall, other database): everything inside the local window.
-        None if matches!(coll, TRANSACTIONS | DAY_END_LOGS) => {
+        None if matches!(coll, TRANSACTIONS | DAY_END_LOGS | DELIVERY_SALES) => {
             base.insert("dateString", doc! { "$gte": time::retention_cutoff(&time::today()) });
         }
         None => {}
@@ -928,7 +1040,9 @@ async fn pull_machines(core: &Core, db: &Database) -> Result<(), SyncError> {
     Ok(())
 }
 
-async fn cloud_day(core: &Core, date: &str) -> Result<(Vec<TransactionDTO>, Option<DayEndDTO>), SyncError> {
+type CloudDay = (Vec<TransactionDTO>, Option<DayEndDTO>, Vec<DeliverySalesDTO>);
+
+async fn cloud_day(core: &Core, date: &str) -> Result<CloudDay, SyncError> {
     let db = core.sync.remote().ok_or_else(|| SyncError::Local("Not connected to the cloud.".into()))?;
     // The whole office's entries; each PC's copy of the day-end counts merged into one.
     let fetch = async {
@@ -941,16 +1055,19 @@ async fn cloud_day(core: &Core, date: &str) -> Result<(Vec<TransactionDTO>, Opti
             .await?;
         let days = find_all(&db, DAY_END_LOGS, doc! { "dateString": date }).await?;
         let day = days.iter().map(day_copy_from_doc).reduce(|a, b| store::merge_day(&a, &b)).map(|d| d.day);
-        Ok::<_, mongodb::error::Error>((txs.iter().map(tx_from_doc).collect::<Vec<_>>(), day))
+        let mut sales: Vec<DeliverySalesDTO> =
+            find_all(&db, DELIVERY_SALES, doc! { "dateString": date }).await?.iter().map(sales_from_doc).collect();
+        sales.sort_by_key(|s| s.delivery_boy_name.to_lowercase());
+        Ok::<_, mongodb::error::Error>((txs.iter().map(tx_from_doc).collect::<Vec<_>>(), day, sales))
     };
     match tokio::time::timeout(Duration::from_secs(10), fetch).await {
-        Ok(Ok((mut txs, day))) => {
+        Ok(Ok((mut txs, day, sales))) => {
             let names: std::collections::HashMap<String, String> =
                 core.with_db(|c| store::office_pcs(c))?.into_iter().map(|p| (p.machine_id, p.device_name)).collect();
             for t in &mut txs {
                 t.created_by_name = t.created_by.as_ref().and_then(|id| names.get(id).cloned());
             }
-            Ok((txs, day))
+            Ok((txs, day, sales))
         }
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(SyncError::Local("The cloud took too long to answer.".into())),
@@ -964,7 +1081,9 @@ pub async fn history_day(core: &Core, date: &str) -> R<HistoryDayDTO> {
     if !time::is_valid_date(date) || date > today.as_str() {
         return Err("Pick a valid date that isn't in the future.".into());
     }
-    let (txs, day_end) = core.with_db(|c| Ok((store::transactions_for_date(c, date)?, store::get_day_end(c, date)?)))?;
+    let (txs, day_end, sales) = core.with_db(|c| {
+        Ok((store::transactions_for_date(c, date)?, store::get_day_end(c, date)?, store::sales_for_date(c, date)?))
+    })?;
     let cutoff = time::retention_cutoff(&today);
     let mut result = HistoryDayDTO {
         date: date.to_string(),
@@ -973,17 +1092,19 @@ pub async fn history_day(core: &Core, date: &str) -> R<HistoryDayDTO> {
         message: None,
         transactions: txs,
         day_end,
+        sales,
     };
     if date >= cutoff.as_str() || core.sync.config().is_none() {
         return Ok(result);
     }
     match cloud_day(core, date).await {
-        Ok((txs, day_end)) => {
+        Ok((txs, day_end, sales)) => {
             result.source = "cloud";
             result.transactions = txs;
             result.day_end = day_end;
+            result.sales = sales;
         }
-        Err(_) if !result.transactions.is_empty() || result.day_end.is_some() => {
+        Err(_) if !result.transactions.is_empty() || result.day_end.is_some() || !result.sales.is_empty() => {
             result.message = Some("Offline: showing the copy still saved on this PC.".into());
         }
         Err(_) => {

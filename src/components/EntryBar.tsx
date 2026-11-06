@@ -4,11 +4,9 @@ import { call, mutate } from "@/lib/api";
 import { formatINR } from "@/lib/format";
 import { PAYMENT_LABEL } from "@/lib/payment";
 import { useQuery } from "@/lib/useQuery";
-import type { DeliveryBoyDTO, PaymentMode, ProductSuggestion as Suggestion, TransactionDTO, TransactionType } from "@/lib/types";
+import type { OfficeSettingsDTO, PaymentMode, ProductSuggestion as Suggestion, TransactionDTO, TransactionType } from "@/lib/types";
 
 const CONSUMER_NO_DIGITS = 6;
-/** Delivery boy entries count cylinders: 1 to 9999. */
-const QUANTITY_DIGITS = 4;
 /** Other products take any text in the Consumer No box (name, phone, note…). */
 const OTHER_NOTE_MAX = 60;
 
@@ -16,10 +14,7 @@ const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().t
 
 export function EntryBar() {
   const [type, setType] = useState<TransactionType>("CASH_IN");
-  // "" = Office; otherwise the delivery boy the entry is for.
-  const [role, setRole] = useState("");
   const [consumerNo, setConsumerNo] = useState("");
-  const [quantity, setQuantity] = useState("");
   const [isOther, setIsOther] = useState(false);
   const [payment, setPayment] = useState<PaymentMode>("CASH");
   const [product, setProduct] = useState("");
@@ -40,18 +35,11 @@ export function EntryBar() {
   // Focus requested for after the next render (e.g. Consumer No is disabled until type resets to Cash In).
   const focusAfterRender = useRef<"consumer" | "product" | "price" | null>(null);
 
-  const { data: allBoys } = useQuery<DeliveryBoyDTO[]>("list_delivery_boys");
-  const boys = allBoys?.filter((b) => b.isActive) ?? [];
-  const roleBoy = boys.find((b) => b.id === role);
-  const isBoy = !!role;
-
-  // A delivery boy removed in Settings (here or on another PC) can't stay selected.
-  useEffect(() => {
-    if (role && allBoys && !roleBoy) setRole("");
-  }, [role, allBoys, roleBoy]);
-
   const isCashIn = type === "CASH_IN";
-  // Office: the consumer number; a delivery boy: the quantity. Either is optional for Other products.
+  // A System Cash In has the fixed price from Settings: shown in the price box, not typed.
+  const { data: officeSettings } = useQuery<OfficeSettingsDTO>("get_office_settings");
+  const systemPrice = officeSettings?.systemPrice ?? null;
+  const fixedPrice = isCashIn && payment === "SYSTEM";
   const consumerRequired = isCashIn && !isOther;
   const query = product.trim();
 
@@ -99,16 +87,9 @@ export function EntryBar() {
 
   const CONSUMER_HINT = "Enter the 6-digit consumer number, or press F3 for “Other product”.";
 
-  const QUANTITY_HINT = "Enter the quantity, or press F3 for “Other product”.";
-
-  /** Problem with the consumer number (or a delivery boy's quantity) for the current entry, if any. */
+  /** Problem with the consumer number for the current entry, if any. */
   const consumerProblem = () => {
-    if (!isCashIn) return null;
-    if (isBoy) {
-      if (!quantity) return isOther ? null : QUANTITY_HINT;
-      return Number(quantity) >= 1 ? null : "Quantity must be at least 1.";
-    }
-    if (isOther) return null;
+    if (!isCashIn || isOther) return null;
     if (!consumerNo) return CONSUMER_HINT;
     return consumerNo.length === CONSUMER_NO_DIGITS ? null : `Consumer number must be exactly ${CONSUMER_NO_DIGITS} digits.`;
   };
@@ -123,22 +104,13 @@ export function EntryBar() {
     if (next === "CASH_OUT" && document.activeElement === consumerRef.current) focusAfterRender.current = "price";
   };
 
-  const switchRole = (next: string) => {
-    setRole(next);
-    setError(null);
-    // The box after the product means something else now (consumer number <-> quantity).
-    setConsumerNo("");
-    setQuantity("");
-    focusAfterRender.current = "product";
-  };
-
   const toggleOther = (next: boolean) => {
     setIsOther(next);
     setError(null);
     // Back to a normal entry: a typed note can't stay in the 6-digit box.
-    if (!next && !isBoy) setConsumerNo((c) => c.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
+    if (!next) setConsumerNo((c) => c.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
     // Ticking it from an empty Consumer No box means "no number" -> go straight to the price.
-    if (next && !(isBoy ? quantity : consumerNo) && document.activeElement === consumerRef.current) priceRef.current?.focus();
+    if (next && !consumerNo && document.activeElement === consumerRef.current) priceRef.current?.focus();
   };
 
   /** Online and System are tick boxes that exclude each other; no tick = Cash. */
@@ -182,8 +154,6 @@ export function EntryBar() {
     lookupRef.current = null; // prices may have just changed
     focusAfterRender.current = "product"; // every entry starts at the product
     setConsumerNo("");
-    setQuantity("");
-    setRole(""); // every entry is for the Office unless a delivery boy is chosen
     setIsOther(false); // safe default: consumer number required again
     setPayment("CASH"); // every entry is cash unless ticked
     setProduct("");
@@ -208,9 +178,13 @@ export function EntryBar() {
       consumerRef.current?.focus();
       return;
     }
-    const typedPrice = price.trim();
+    const typedPrice = fixedPrice ? "" : price.trim();
+    if (fixedPrice && !systemPrice) {
+      setError("Set the System payment price in Settings first.");
+      return;
+    }
     // Empty price = fast path: the backend resolves the product's lastUsedPrice.
-    if (!typedPrice && !selected && !suggestions.some((s) => sameName(s.name, name))) {
+    if (!fixedPrice && !typedPrice && !selected && !suggestions.some((s) => sameName(s.name, name))) {
       setError(`"${name}" is a new item — enter its price.`);
       priceRef.current?.focus();
       return;
@@ -223,30 +197,20 @@ export function EntryBar() {
         type,
         productName: name,
         price: typedPrice || null,
-        consumerNo: isCashIn && !isBoy ? consumerNo : null,
-        quantity: isCashIn && isBoy ? quantity || null : null,
-        roleId: role || null,
+        consumerNo: isCashIn ? consumerNo : null,
         isOtherProduct: isCashIn && isOther,
         paymentMode: payment,
       });
       if (res.ok) {
         const t = res.data;
-        const forWhom = t.roleName ? ` · ${t.roleName}` : "";
-        const qty = t.quantity ? ` · Qty ${t.quantity}` : "";
         const who =
-          t.type === "CASH_OUT"
-            ? forWhom
-            : t.roleName
-              ? `${forWhom}${t.isOtherProduct ? " · Other product" : ""}${qty}`
-              : t.isOtherProduct
-                ? ` · Other product${t.consumerNo ? ` · ${t.consumerNo}` : ""}`
-                : ` · #${t.consumerNo}`;
+          t.type === "CASH_OUT" ? "" : t.isOtherProduct ? ` · Other product${t.consumerNo ? ` · ${t.consumerNo}` : ""}` : ` · #${t.consumerNo}`;
         const paid = t.paymentMode && t.paymentMode !== "CASH" ? ` · ${PAYMENT_LABEL[t.paymentMode]}` : "";
         setFlash(`${t.type === "CASH_IN" ? "Cash In" : "Cash Out"}${who} · ${t.productName} · ${formatINR(t.price)}${paid}`);
         resetForNext();
       } else {
         setError(res.error);
-        (/consumer|quantity/i.test(res.error) ? consumerRef : /delivery boy/i.test(res.error) ? productRef : priceRef).current?.focus();
+        (/consumer/i.test(res.error) ? consumerRef : priceRef).current?.focus();
       }
     } finally {
       inFlight.current = false;
@@ -374,31 +338,8 @@ export function EntryBar() {
           </div>
         </div>
 
-        {/* Role: the Office, or the delivery boy the entry is for */}
-        <div className="w-24">
-          <label htmlFor="entry-role" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Role
-          </label>
-          <select
-            id="entry-role"
-            value={roleBoy ? role : ""}
-            onChange={(e) => switchRole(e.target.value)}
-            title={roleBoy ? `Entry for delivery boy ${roleBoy.name}` : "Office entry"}
-            className={`h-[50px] w-full truncate rounded-lg border px-2 text-sm outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 ${
-              isBoy ? "border-amber-500 bg-amber-50 font-semibold text-amber-900" : "border-slate-300 bg-white text-slate-700"
-            }`}
-          >
-            <option value="">Office</option>
-            {boys.map((b) => (
-              <option key={b.id} value={b.id}>
-                {b.name}
-              </option>
-            ))}
-          </select>
-        </div>
-
         {/* Product with autocomplete */}
-        <div className="relative min-w-40 flex-1">
+        <div className="relative min-w-48 flex-1">
           <label htmlFor="entry-product" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Product / Item
           </label>
@@ -427,7 +368,7 @@ export function EntryBar() {
             onKeyDown={onProductKeyDown}
             onFocus={() => suggestions.length && setOpen(true)}
             onBlur={() => setOpen(false)}
-            placeholder="Start typing…"
+            placeholder="Start typing… (Tab to autocomplete)"
             className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-lg outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20"
           />
           {open && suggestions.length > 0 && (
@@ -465,59 +406,33 @@ export function EntryBar() {
           )}
         </div>
 
-        {/* Cash In only. Office: Consumer No, exactly 6 digits (any text for Other products).
-            Delivery boy: Quantity instead (optional for Other products). */}
-        <div className="w-32">
+        {/* Consumer No (Cash In only): exactly 6 digits, or any text for Other products */}
+        <div className="w-36">
           <label htmlFor="entry-consumer" className="mb-1 block whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-slate-500">
-            {isBoy ? "Quantity" : "Consumer No"} <span className={`text-red-600 ${consumerRequired ? "" : "invisible"}`}>*</span>
+            Consumer No <span className={`text-red-600 ${consumerRequired ? "" : "invisible"}`}>*</span>
           </label>
-          {isBoy ? (
-            <input
-              id="entry-consumer"
-              key="quantity"
-              ref={consumerRef}
-              inputMode="numeric"
-              autoComplete="off"
-              maxLength={QUANTITY_DIGITS}
-              disabled={!isCashIn}
-              aria-required={consumerRequired}
-              value={isCashIn ? quantity : ""}
-              onChange={(e) => {
-                setQuantity(e.target.value.replace(/\D/g, "").slice(0, QUANTITY_DIGITS));
-                setError(null);
-              }}
-              onKeyDown={onConsumerKeyDown}
-              onFocus={(e) => e.target.select()}
-              placeholder={!isCashIn ? "N/A" : isOther ? "Optional" : "Qty"}
-              className={`tabular w-full rounded-lg border px-3 py-2.5 text-center text-lg outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50 placeholder:text-base ${
-                isCashIn && isOther ? "border-dashed border-slate-300" : "border-slate-300"
-              }`}
-            />
-          ) : (
-            <input
-              id="entry-consumer"
-              key="consumer"
-              ref={consumerRef}
-              inputMode={isOther ? "text" : "numeric"}
-              autoComplete="off"
-              maxLength={isOther ? OTHER_NOTE_MAX : CONSUMER_NO_DIGITS}
-              disabled={!isCashIn}
-              aria-required={consumerRequired}
-              value={isCashIn ? consumerNo : ""}
-              onChange={(e) => {
-                const v = e.target.value;
-                setConsumerNo(isOther ? v.slice(0, OTHER_NOTE_MAX) : v.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
-                setError(null);
-              }}
-              onKeyDown={onConsumerKeyDown}
-              onFocus={(e) => e.target.select()}
-              placeholder={!isCashIn ? "N/A" : isOther ? "Optional · any text" : "6 digits"}
-              title={isCashIn && isOther ? consumerNo : undefined}
-              className={`tabular w-full rounded-lg border px-3 py-2.5 text-center outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50 placeholder:tracking-normal ${
-                isCashIn && isOther ? "border-dashed border-slate-300 text-base placeholder:text-sm" : "border-slate-300 text-lg tracking-widest"
-              }`}
-            />
-          )}
+          <input
+            id="entry-consumer"
+            ref={consumerRef}
+            inputMode={isOther ? "text" : "numeric"}
+            autoComplete="off"
+            maxLength={isOther ? OTHER_NOTE_MAX : CONSUMER_NO_DIGITS}
+            disabled={!isCashIn}
+            aria-required={consumerRequired}
+            value={isCashIn ? consumerNo : ""}
+            onChange={(e) => {
+              const v = e.target.value;
+              setConsumerNo(isOther ? v.slice(0, OTHER_NOTE_MAX) : v.replace(/\D/g, "").slice(0, CONSUMER_NO_DIGITS));
+              setError(null);
+            }}
+            onKeyDown={onConsumerKeyDown}
+            onFocus={(e) => e.target.select()}
+            placeholder={!isCashIn ? "N/A" : isOther ? "Optional · any text" : "6 digits"}
+            title={isCashIn && isOther ? consumerNo : undefined}
+            className={`tabular w-full rounded-lg border px-3 py-2.5 text-center outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50 placeholder:tracking-normal ${
+              isCashIn && isOther ? "border-dashed border-slate-300 text-base placeholder:text-sm" : "border-slate-300 text-lg tracking-widest"
+            }`}
+          />
         </div>
 
         {/* Other product: Cash In without a consumer number. Fixed size so it never moves under the cursor. */}
@@ -525,7 +440,7 @@ export function EntryBar() {
           <label
             // Keep focus in whichever box the operator was typing in; the click only toggles.
             onMouseDown={(e) => e.preventDefault()}
-            title={`Other product: Cash In without ${isBoy ? "a quantity" : "a consumer number"} (F3)`}
+            title="Other product: Cash In without a consumer number (F3)"
             className={`flex select-none items-center gap-1.5 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-xs font-medium ${
               !isCashIn
                 ? "cursor-not-allowed border-slate-200 text-slate-300"
@@ -548,7 +463,7 @@ export function EntryBar() {
         </div>
 
         {/* Price with ghost default */}
-        <div className="w-32">
+        <div className="w-36">
           <label htmlFor="entry-price" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
             Price (₹)
           </label>
@@ -557,7 +472,9 @@ export function EntryBar() {
             ref={priceRef}
             inputMode="decimal"
             autoComplete="off"
-            value={price}
+            value={fixedPrice ? (systemPrice?.toFixed(2) ?? "") : price}
+            readOnly={fixedPrice}
+            title={fixedPrice ? "Fixed System payment price (Settings)" : undefined}
             onChange={(e) => {
               const v = e.target.value.replace(/[^\d.]/g, "");
               if (/^\d*\.?\d{0,2}$/.test(v)) setPrice(v);
@@ -565,9 +482,11 @@ export function EntryBar() {
             }}
             onKeyDown={onPriceKeyDown}
             onFocus={(e) => e.target.select()}
-            placeholder={ghost || "0.00"}
-            className={`tabular w-full rounded-lg border border-slate-300 px-3 py-2.5 text-right text-lg outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 ${
-              ghost ? "placeholder:text-slate-400 placeholder:italic" : "placeholder:text-slate-300"
+            placeholder={fixedPrice ? "Set in Settings" : ghost || "0.00"}
+            className={`tabular w-full rounded-lg border px-3 py-2.5 text-right text-lg outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 ${
+              fixedPrice
+                ? "border-orange-300 bg-orange-50 text-orange-900 placeholder:text-sm placeholder:text-amber-700"
+                : `border-slate-300 ${ghost ? "placeholder:text-slate-400 placeholder:italic" : "placeholder:text-slate-300"}`
             }`}
           />
         </div>
@@ -600,6 +519,11 @@ export function EntryBar() {
           ) : flash ? (
             <span className="flex items-center gap-1.5 font-medium text-emerald-700">
               <CheckCircle2 className="h-4 w-4" /> Saved: {flash}
+            </span>
+          ) : fixedPrice ? (
+            <span className="text-orange-800">
+              System payment ·{" "}
+              {systemPrice ? `fixed price ${formatINR(systemPrice)} (from Settings)` : "set the System payment price in Settings first"}
             </span>
           ) : selected && !price ? (
             <span className="flex items-center gap-1.5 text-slate-500">

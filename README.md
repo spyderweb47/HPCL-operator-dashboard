@@ -8,8 +8,9 @@ in real time whenever the internet is available.
 - **Same UI** as the web version: same keyboard flow, same rules (6-digit consumer number, Other product, ghost price, soft delete with audit, finalize lock).
 - **Several PCs, one office.** Every PC set to the same cloud database shares one register, product catalog, delivery boys and day end, updated within a few seconds. See [Several PCs in one office](#several-pcs-in-one-office).
 - **Your name** (Settings → Your Name): a plain name, no password. Every entry, edit and delete made on that PC carries it in the cloud (`createdByUser`, `updatedByUser`, and `user` in each audit step), so the office can see who did what.
-- **Role** on every entry: **Office** by default, or a delivery boy from Settings. For a delivery boy's Cash In, the Consumer No box becomes **Quantity** (required; optional with Other product). The row shows the delivery boy's name under the type.
-- **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online or system entries.
+- **Delivery boys on the Day End page.** A sheet with one row per delivery boy for the day: what he **sold** (product + quantity; usually one product, sometimes more, or none; his usual product is offered in grey, so typing the quantity is enough), the **money he reports**: Cash and Online as totals, and each **System** payment on its own line with the consumer number and an optional name (filled in by itself for a consumer seen before), at the fixed System price, and his **expenses** (fuel, service, anything else). Product and expense names autocomplete like the register's product box (type, `Tab` to fill in, `Esc` to keep a new name); new names are remembered for next time. Each row shows the **cash to hand over** (cash − expenses) and the cash + online received; System payments are totalled on their own. A Total row adds up all delivery boys. Saves itself as you type; locked by Finalize; shown in History.
+- **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online entries.
+- **System payments have a fixed price**, set once in **Settings → System Payment Price** (shared by the office's PCs). Ticking System on a Cash In fills the price in by itself (it can't be typed), and every delivery boy system payment takes it too. Changing the price affects new payments only. Their total shows in the Cash In card's split (Cash · Online · System).
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
 
 ## How offline and sync work
@@ -45,13 +46,14 @@ entries, edits and deletes, the product catalog (ghost prices), delivery boys an
 
 **Adding a PC:** install HPCL Operator on it, open **Settings → Cloud Database** and enter the same details
 as on the first PC. Within a few seconds it has the office's last 180 days. All PCs should run version 1.6 or newer
-(1.5 shares entries but doesn't show roles or quantities). The office's PCs, with the name set on each, are in the
+(1.5 shares entries but doesn't show roles or quantities; before 1.8 the Delivery Boys section on Day End isn't shared). The office's PCs, with the name set on each, are in the
 cloud's `machines` collection.
 
 | Situation | What happens |
 | --- | --- |
 | Entry made on one PC | Appears on the others within about 5 s, without reloading. When the register has entries from more than one person or PC, each row shows who made it (the name from Settings, or the PC's name) under the time. |
 | Same entry edited on two PCs | The later edit wins on every PC (by the time of the edit). The audit trail is kept. |
+| Same delivery boy's row filled on two PCs | The last change wins for that delivery boy's row. A row open on the other PC updates when it isn't being typed in. |
 | Day End stock filled on two PCs | Merged **count by count**: each box keeps the number typed last, wherever it was typed, so two people can fill different rows at the same time. A form open on one PC updates with the other PC's numbers as they arrive. |
 | Finalize on one PC | Locks the day on every PC. Entries that a PC made offline before it heard about the finalize are still kept and counted. |
 | One PC offline | It keeps working from its own file. When it reconnects, it uploads its changes and downloads the others'. |
@@ -99,8 +101,8 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
 { _id: "uuid", machineId, dateString: "2026-10-30", type: "CASH_IN" | "CASH_OUT",
   productName: "Regulator", price: 350.0, consumerNo: "123456" | null, isOtherProduct: false,
   paymentMode: "CASH" | "ONLINE" | "SYSTEM",   // missing on entries from before v1.4 = "CASH"
-  roleId: "delivery boy uuid" | null, roleName: "Suresh Patil" | null,   // null = Office (v1.6+)
-  quantity: 3 | null,                          // delivery boy Cash In entries (v1.6+)
+  roleId: "delivery boy uuid" | null, roleName: "Suresh Patil" | null,   // only on entries made for a delivery boy with v1.6–1.7
+  quantity: 3 | null,                          // same (the Role box was removed in v1.8)
   createdByUser: "Ramesh" | null, updatedByUser: "Ravi" | null,   // names from Settings (v1.6+)
   status: "ACTIVE" | "EDITED" | "DELETED", isDayFinalized: false,
   auditLog: [{ action: "CREATED"|"UPDATED"|"DELETED", previousProductName, newProductName, previousPrice, newPrice,
@@ -120,6 +122,24 @@ From v1.6 the Day End page records only the cylinder stock; `deliveries` keeps c
   cylinderStock: { kg5: { full, empty }, kg14: { full, empty }, kg19: { full, empty } },
   isFinalized: true, finalizedAt: Date | null, createdAt: Date, updatedAt: Date, syncedAt: Date,
   stamps: [{ cell: "bills:<deliveryBoyId>" | "cyl:<deliveryBoyId>" | "kg14.full" | …, at: Date }] | null }  // when each count was typed (v1.5+)
+```
+
+**`deliverysales`** (v1.8+): one document per delivery boy per day, shared by the office's PCs (`_id` = `"<dateString>:<deliveryBoyId>"`; the last change wins).
+```js
+{ _id: "2026-11-06:uuid", dateString: "2026-11-06", deliveryBoyId: "uuid", deliveryBoyName: "Suresh Patil",
+  products: [{ name: "Refill 14.2kg", quantity: 12 }],        // what he sold (quantity 0 = row still being filled in)
+  cash: 10500.0, online: 2400.0,                              // money he reported, for all his sales together
+  systemPayments: [{ consumerNo: "123456", name: "Anil Kumar" | null, amount: 900.0 }],   // one per system payment, at the fixed price
+  system: 900.0, systemCount: 1,                              // their total, counted apart from totalReceived
+  expenses: [{ name: "Fuel", amount: 200.0 }],                // name as typed (autocompleted from earlier ones)
+  totalReceived: 12900.0, totalExpenses: 200.0, cashToHandOver: 10300.0,   // received = cash + online; hand over = cash − expenses
+  updatedBy: "machine id", updatedByUser: "Ramesh" | null, createdAt: Date, updatedAt: Date, syncedAt: Date }
+```
+Indexes: `{dateString}`, `{deliveryBoyId, dateString}`, `{systemPayments.consumerNo}`, `{syncedAt, _id}`.
+
+**`officesettings`** (v1.8+): settings shared by the office's PCs; the last change wins.
+```js
+{ _id: "system_price", value: "900", updatedBy: "machine id", updatedByUser: "Ramesh" | null, updatedAt: Date, syncedAt: Date }
 ```
 
 **`deliveryboys`**: managed in this app's Settings. Deactivated, never deleted.
@@ -144,11 +164,14 @@ From v1.6 the Day End page records only the cylinder stock; `deliveries` keeps c
 | Key | Where | Action |
 | --- | --- | --- |
 | `F2` | anywhere | Switch Cash In / Cash Out (goes back to Cash In after each save) |
-| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text), or for a delivery boy, without a quantity |
+| `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text) |
 | `F4` / `F6` | anywhere | Tick or untick **Online** / **System** payment. Neither ticked = Cash; goes back to Cash after each save. |
 | type, `↑`/`↓`, `Tab`/`Enter` | Product | Autocomplete from the catalog, then go to Consumer No (Cash In) or Price |
 | `Esc` | Product | Keep the typed text as a **new item** |
-| `Enter`/`Tab` | Consumer No / Quantity | Go to Price. Blocked until it's exactly 6 digits / a quantity (or empty with Other product). |
+| `Enter`/`Tab` | Consumer No | Go to Price. Blocked until it's exactly 6 digits (or empty with Other product). |
+| type, `↑`/`↓`, `Tab`/`Enter` | Day End product / expense name | Autocomplete from names used before (and the catalog), then go to the next box |
+| `Esc` | Day End product / expense name | Keep the typed text as a **new name** |
+| `Enter` | Day End delivery boy row | Next box of the row |
 | `Enter` | Price | Save. Empty Price uses the grey ghost price. |
 | `Esc` | Consumer No / Price | Go back one box |
 | `Enter` / `Esc` | inline row edit | Save / cancel |
@@ -242,7 +265,7 @@ Windows 7 itself no longer gets security updates from Microsoft, and WebView2 10
 src/                 React UI (Vite + Tailwind v4): pages/, components/, lib/api.ts (backend calls)
 src-tauri/src/
   cloud_config.rs    Cloud settings (Settings page / cloud.json), connection string handling
-  store.rs           Business rules over SQLite (entries, edit/delete audit, day end, delivery boys)
+  store.rs           Business rules over SQLite (entries, edit/delete audit, day end, delivery boys and their sales)
   cloud.rs           Sync worker, cloud indexes, restore, history-from-cloud, pruning
   core.rs            Machine ID, shared state, the single `call` command dispatcher
   db.rs              SQLite schema + migrations      time.rs   business day (IST) + retention

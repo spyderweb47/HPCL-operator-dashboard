@@ -7,9 +7,22 @@ export const STOCK_ROWS = [
   { key: "kg19", label: "19 kg" },
 ] as const;
 
-export function Card({ title, icon: Icon, children, aside }: { title: string; icon: typeof Bike; children: React.ReactNode; aside?: React.ReactNode }) {
+export function Card({
+  title,
+  icon: Icon,
+  children,
+  aside,
+  clip = true,
+}: {
+  title: string;
+  icon: typeof Bike;
+  children: React.ReactNode;
+  aside?: React.ReactNode;
+  /** false: let suggestion lists drop down past the card's edge. */
+  clip?: boolean;
+}) {
   return (
-    <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+    <section className={`${clip ? "overflow-hidden" : ""} rounded-xl border border-slate-200 bg-white shadow-sm`}>
       <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
         <h2 className="flex items-center gap-2 font-semibold text-slate-800">
           <Icon className="h-4 w-4 text-hp-blue" /> {title}

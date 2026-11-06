@@ -35,10 +35,9 @@ export type TransactionDTO = {
   createdByName: string | null;
   /** Operator name (Settings) of whoever made the entry. */
   createdByUser: string | null;
-  /** The delivery boy the entry is for (null = Office), and his name at the time. */
+  /** Entries made for a delivery boy with v1.6–1.7 (Role box, since removed): his ID and name, and the cylinder count. */
   roleId: string | null;
   roleName: string | null;
-  /** Cylinders, for delivery boy entries. */
   quantity: number | null;
   status: "ACTIVE" | "EDITED" | "DELETED";
   isDayFinalized: boolean;
@@ -72,10 +71,45 @@ export type RegisterDTO = {
   transactions: TransactionDTO[];
 };
 
+export type SoldProduct = { name: string; quantity: number };
+
+/** name: what it was for, as typed ("Fuel", "Service", "Tyre puncture"…). */
+export type Expense = { name: string; amount: number };
+
+/** Names offered while typing on the delivery boy cards, most used first. */
+export type SalesSuggestions = {
+  products: string[];
+  expenses: string[];
+  /** Consumers seen on earlier system payments, with the name last typed for them. */
+  consumers: { consumerNo: string; name: string }[];
+};
+
+/** A system payment a delivery boy collected: whose and how much. */
+export type SystemPayment = { consumerNo: string; name: string | null; amount: number };
+
+/** One delivery boy's day: what he sold, the money he reported by payment type, and what he spent. */
+export type DeliverySalesDTO = {
+  deliveryBoyId: string;
+  deliveryBoyName: string;
+  products: SoldProduct[];
+  cash: number;
+  online: number;
+  /** Total of systemPayments. */
+  system: number;
+  systemPayments: SystemPayment[];
+  expenses: Expense[];
+  /** The product he sold most recently before today. */
+  usualProduct: string | null;
+  updatedByUser: string | null;
+  /** null = nothing saved yet today. */
+  updatedAt: string | null;
+};
+
 export type DayEndPageDTO = {
   date: string;
   dayEnd: DayEndDTO;
   transactions: TransactionDTO[];
+  sales: DeliverySalesDTO[];
 };
 
 /** Where a history day came from: this PC, the cloud (older than the local window), or nowhere (offline). */
@@ -88,6 +122,7 @@ export type HistoryDayDTO = {
   message: string | null;
   transactions: TransactionDTO[];
   dayEnd: DayEndDTO | null;
+  sales: DeliverySalesDTO[];
 };
 
 export type DeliveryBoyDTO = { id: string; name: string; isActive: boolean; createdAt: string };
@@ -125,6 +160,12 @@ export type AppInfoDTO = {
 };
 
 export type ActionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string };
+
+/** Settings shared by the office's PCs. */
+export type OfficeSettingsDTO = {
+  /** The fixed price of a System payment. null = not set yet. */
+  systemPrice: number | null;
+};
 
 export type Totals = {
   /** All Cash In / Cash Out entries, whatever the payment type. */

@@ -5,6 +5,7 @@ import { useQuery } from "@/lib/useQuery";
 import { computeTotals } from "@/lib/totals";
 import type { HistoryDayDTO } from "@/lib/types";
 import { DeliveriesView, StockView } from "@/components/DayEndViews";
+import { DeliverySalesView } from "@/components/DeliverySales";
 import { HistoryDatePicker } from "@/components/HistoryDatePicker";
 import { LoadError } from "@/components/LoadError";
 import { RegisterTable } from "@/components/RegisterTable";
@@ -21,7 +22,8 @@ export function HistoryPage() {
   const log = data?.dayEnd ?? null;
   const rows = data?.transactions ?? [];
   const deliveries = (log?.deliveries ?? []).filter((d) => d.cylindersDelivered > 0);
-  const empty = rows.length === 0 && !log;
+  const sales = data?.sales ?? [];
+  const empty = rows.length === 0 && !log && sales.length === 0;
 
   return (
     <div className="space-y-4">
@@ -72,6 +74,7 @@ export function HistoryPage() {
         <>
           <TotalsBar totals={computeTotals(rows)} />
           <RegisterTable rows={rows} editable={false} title="Cash In / Cash Out Register" />
+          <DeliverySalesView sales={sales} />
           {/* Delivery counts were only recorded before v1.6: shown just for those days. */}
           <div className={`grid gap-4 ${deliveries.length ? "lg:grid-cols-2" : ""}`}>
             {deliveries.length > 0 && <DeliveriesView deliveries={deliveries} />}

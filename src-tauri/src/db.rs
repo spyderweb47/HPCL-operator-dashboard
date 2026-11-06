@@ -116,6 +116,41 @@ ALTER TABLE transactions ADD COLUMN created_by_user TEXT;
 ALTER TABLE transactions ADD COLUMN updated_by_user TEXT;
 
 ALTER TABLE machines ADD COLUMN user_name TEXT;
+"#, r#"
+-- v1.8: what each delivery boy sold and handed in, per day (Day End page). One row per delivery
+-- boy per day, shared by the office's PCs (id = "<date>:<delivery boy id>"); the last change wins.
+CREATE TABLE delivery_sales (
+  id                TEXT PRIMARY KEY,
+  date_string       TEXT NOT NULL,
+  delivery_boy_id   TEXT NOT NULL,
+  delivery_boy_name TEXT NOT NULL,
+  products          TEXT NOT NULL DEFAULT '[]',  -- [{"name", "quantity"}]
+  cash              REAL NOT NULL DEFAULT 0,
+  online            REAL NOT NULL DEFAULT 0,
+  system            REAL NOT NULL DEFAULT 0,     -- total of system_payments
+  system_payments   TEXT NOT NULL DEFAULT '[]',  -- [{"consumerNo", "name", "amount"}]
+  expenses          TEXT NOT NULL DEFAULT '[]',  -- [{"kind": "FUEL"|"SERVICE"|"OTHER", "note", "amount"}]
+  updated_by_user   TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  version           INTEGER NOT NULL DEFAULT 1,
+  synced_version    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX delivery_sales_by_date ON delivery_sales (date_string);
+CREATE INDEX delivery_sales_by_boy ON delivery_sales (delivery_boy_id, date_string);
+CREATE INDEX delivery_sales_pending ON delivery_sales (id) WHERE version > synced_version;
+
+-- Settings shared by the office's PCs, e.g. "system_price" (the fixed price of a System payment).
+-- The last change wins.
+CREATE TABLE office_settings (
+  id              TEXT PRIMARY KEY,
+  value           TEXT NOT NULL,
+  updated_by_user TEXT,
+  updated_at      TEXT NOT NULL,
+  version         INTEGER NOT NULL DEFAULT 1,
+  synced_version  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX office_settings_pending ON office_settings (id) WHERE version > synced_version;
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

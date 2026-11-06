@@ -25,7 +25,6 @@ const CONSUMER_INVALID: &str = "Consumer number must be exactly 6 digits.";
 const OTHER_NOTE_MAX: usize = 60;
 const INVALID_PRICE: &str = "Enter a valid price greater than 0.";
 const QUANTITY_MAX: i64 = 9999;
-const QUANTITY_REQUIRED: &str = "Enter the quantity, or tick “Other product”.";
 const QUANTITY_INVALID: &str = "Quantity must be a whole number from 1 to 9999.";
 const USER_NAME_MAX: usize = 40;
 
@@ -99,7 +98,8 @@ fn parse_payment_mode(v: Option<&str>) -> R<&'static str> {
     PAYMENT_MODES.into_iter().find(|m| m.eq_ignore_ascii_case(v)).ok_or_else(|| format!("Unknown payment type \"{v}\"."))
 }
 
-/// Delivery boy entries: a whole number from 1 to QUANTITY_MAX. Empty -> Ok(None).
+/// Quantity on delivery boy entries made with v1.6–1.7 (editable on those rows only).
+/// A whole number from 1 to QUANTITY_MAX. Empty -> Ok(None).
 fn parse_quantity(v: &Value) -> R<Option<i64>> {
     let n = match v {
         Value::Null => return Ok(None),
@@ -151,6 +151,58 @@ fn count(v: &Value) -> i64 {
     } else {
         0
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Office settings (shared by the office's PCs; the last change wins)
+// ---------------------------------------------------------------------------------------------
+
+const SYSTEM_PRICE_KEY: &str = "system_price";
+pub const SYSTEM_PRICE_MISSING: &str = "Set the System payment price in Settings first.";
+
+/// The fixed price of a System payment, if set.
+pub fn system_price(conn: &Connection) -> R<Option<f64>> {
+    let v: Option<String> = conn
+        .query_row("SELECT value FROM office_settings WHERE id = ?1", [SYSTEM_PRICE_KEY], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    Ok(v.and_then(|v| v.parse::<f64>().ok()).filter(|p| *p > 0.0))
+}
+
+pub fn office_settings(conn: &Connection) -> R<OfficeSettingsDTO> {
+    Ok(OfficeSettingsDTO { system_price: system_price(conn)? })
+}
+
+/// New System payments take this price; ones already saved keep theirs.
+pub fn set_system_price(conn: &Connection, v: &Value) -> R<OfficeSettingsDTO> {
+    let price = parse_price(v).ok().flatten().ok_or(INVALID_PRICE)?;
+    if system_price(conn)? != Some(price) {
+        conn.execute(
+            "INSERT INTO office_settings (id, value, updated_by_user, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_by_user = excluded.updated_by_user,
+                                           updated_at = excluded.updated_at, version = version + 1",
+            params![SYSTEM_PRICE_KEY, price.to_string(), user_name(conn)?, time::now_iso()],
+        )
+        .map_err(db_err)?;
+    }
+    office_settings(conn)
+}
+
+/// A setting changed on another PC. Returns true when this PC's value changed.
+pub fn apply_remote_setting(tx: &Transaction, id: &str, value: &str, user: Option<&str>, updated_at: &str) -> R<bool> {
+    let local: Option<String> =
+        tx.query_row("SELECT updated_at FROM office_settings WHERE id = ?1", [id], |r| r.get(0)).optional().map_err(db_err)?;
+    if local.as_deref().is_some_and(|l| !newer(updated_at, l)) {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO office_settings (id, value, updated_by_user, updated_at, version, synced_version) VALUES (?1, ?2, ?3, ?4, 1, 1)
+         ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_by_user = excluded.updated_by_user,
+                                       updated_at = excluded.updated_at, synced_version = version",
+        params![id, value, user, updated_at],
+    )
+    .map_err(db_err)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -232,6 +284,18 @@ fn touch_product(tx: &Transaction, name: &str, price: f64, now: &str) -> R<Strin
     tx.query_row("SELECT name FROM products WHERE name = ?1", [name], |r| r.get(0)).map_err(db_err)
 }
 
+/// System payments have a fixed price: add the product to the catalog if it's new, but don't
+/// make the fixed price its ghost price.
+fn add_product(tx: &Transaction, name: &str, price: f64, now: &str) -> R<String> {
+    tx.execute(
+        "INSERT INTO products (id, name, last_used_price, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(name) DO NOTHING",
+        params![new_id(), name, price, now],
+    )
+    .map_err(db_err)?;
+    tx.query_row("SELECT name FROM products WHERE name = ?1", [name], |r| r.get(0)).map_err(db_err)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTxInput {
@@ -245,25 +309,9 @@ pub struct CreateTxInput {
     pub consumer_no: Value,
     #[serde(default)]
     pub is_other_product: bool,
-    /// "CASH" (default) | "ONLINE" | "SYSTEM"
+    /// "CASH" (default) | "ONLINE" | "SYSTEM". A System Cash In always takes the fixed System price.
     #[serde(default)]
     pub payment_mode: Option<String>,
-    /// A delivery boy's ID; absent/empty = Office.
-    #[serde(default)]
-    pub role_id: Option<String>,
-    /// Delivery boy Cash In entries: required unless Other product.
-    #[serde(default)]
-    pub quantity: Value,
-}
-
-/// The delivery boy an entry is made for: must be on the active list. None = Office.
-fn resolve_role(conn: &Connection, id: Option<&str>) -> R<Option<(String, String)>> {
-    let Some(id) = id.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
-    conn.query_row("SELECT id, name FROM delivery_boys WHERE id = ?1 AND is_active = 1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
-        .map_err(db_err)?
-        .ok_or_else(|| "This delivery boy is no longer on the list. Choose another role.".to_string())
-        .map(Some)
 }
 
 pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<TransactionDTO> {
@@ -275,29 +323,17 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     let mut price = parse_price(&input.price).map_err(|_| INVALID_PRICE.to_string())?;
     let payment_mode = parse_payment_mode(input.payment_mode.as_deref())?;
 
-    let role = resolve_role(conn, input.role_id.as_deref())?;
     let is_cash_in = kind == "CASH_IN";
     let is_other = is_cash_in && input.is_other_product;
-    // Office Cash In takes a consumer number; a delivery boy's Cash In takes a quantity instead.
-    let (consumer_no, quantity) = match (is_cash_in, &role) {
-        (false, _) => (None, None),
-        (true, None) => {
-            let c = parse_consumer_field(&input.consumer_no, is_other)?;
-            if !is_other && c.is_none() {
-                return Err(CONSUMER_REQUIRED.into());
-            }
-            (c, None)
-        }
-        (true, Some(_)) => {
-            let q = parse_quantity(&input.quantity)?;
-            if !is_other && q.is_none() {
-                return Err(QUANTITY_REQUIRED.into());
-            }
-            (None, q)
-        }
+    let consumer_no = if is_cash_in {
+        parse_consumer_field(&input.consumer_no, is_other)?
+    } else {
+        None
     };
+    if is_cash_in && !is_other && consumer_no.is_none() {
+        return Err(CONSUMER_REQUIRED.into());
+    }
     let (user, machine) = author(conn)?;
-    let (role_id, role_name) = role.unzip();
 
     let date = time::today();
     let now = time::now_iso();
@@ -305,7 +341,10 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     if is_day_finalized(&tx, &date)? {
         return Err("Today's register is finalized. No more entries can be added.".into());
     }
-    if price.is_none() {
+    let fixed = is_cash_in && payment_mode == "SYSTEM";
+    if fixed {
+        price = Some(system_price(&tx)?.ok_or(SYSTEM_PRICE_MISSING)?);
+    } else if price.is_none() {
         let last: Option<f64> = tx
             .query_row("SELECT last_used_price FROM products WHERE name = ?1", [&name], |r| r.get(0))
             .optional()
@@ -313,7 +352,7 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         price = Some(last.ok_or_else(|| format!("\"{name}\" is a new item — enter its price."))?);
     }
     let price = price.unwrap_or_default();
-    let product_name = touch_product(&tx, &name, price, &now)?;
+    let product_name = if fixed { add_product(&tx, &name, price, &now)? } else { touch_product(&tx, &name, price, &now)? };
 
     let audit = vec![AuditEntry {
         action: "CREATED".into(),
@@ -321,7 +360,6 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         new_price: Some(price),
         new_consumer_no: consumer_no.clone(),
         new_payment_mode: Some(payment_mode.into()),
-        new_quantity: quantity,
         user: user.clone(),
         machine_id: machine,
         timestamp: now.clone(),
@@ -330,12 +368,11 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     let id = new_id();
     tx.execute(
         "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product,
-                                   status, audit_log, created_at, updated_at, payment_mode,
-                                   role_id, role_name, quantity, created_by_user, updated_by_user)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                                   status, audit_log, created_at, updated_at, payment_mode, created_by_user, updated_by_user)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10, ?11, ?11)",
         params![
             id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now,
-            payment_mode, role_id, role_name, quantity, user
+            payment_mode, user
         ],
     )
     .map_err(db_err)?;
@@ -407,11 +444,23 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
     if name.is_empty() {
         return Err("Product / item name cannot be empty.".into());
     }
-    let price = parse_price(&input.price).ok().flatten().ok_or(INVALID_PRICE)?;
+    let payment_mode = match input.payment_mode.as_deref() {
+        None => old.payment_mode.clone(),
+        v => parse_payment_mode(v)?.to_string(),
+    };
+    // A System Cash In has the fixed price: kept as it was, or the current one when it becomes System.
+    let fixed = old.kind == "CASH_IN" && payment_mode == "SYSTEM";
+    let price = if fixed && old.payment_mode == "SYSTEM" {
+        old.price
+    } else if fixed {
+        system_price(&tx)?.ok_or(SYSTEM_PRICE_MISSING)?
+    } else {
+        parse_price(&input.price).ok().flatten().ok_or(INVALID_PRICE)?
+    };
 
     // Consumer number only applies to Cash In; the Other-product flag is fixed at entry time.
     // Other products keep free text there, which can be added, changed or cleared.
-    // Delivery boy entries take a quantity there instead (the role is fixed at entry time too).
+    // Delivery boy entries from v1.6–1.7 have a quantity there instead.
     let mut consumer_no = old.consumer_no.clone();
     let mut quantity = old.quantity;
     if old.kind == "CASH_IN" && old.role_id.is_some() {
@@ -426,10 +475,6 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         }
         consumer_no = parsed;
     }
-    let payment_mode = match input.payment_mode.as_deref() {
-        None => old.payment_mode.clone(),
-        v => parse_payment_mode(v)?.to_string(),
-    };
     if name == old.product_name
         && price == old.price
         && consumer_no == old.consumer_no
@@ -443,6 +488,8 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
     // Only touch the catalog when the product or price actually changed.
     let product_name = if name == old.product_name && price == old.price {
         old.product_name.clone()
+    } else if fixed {
+        add_product(&tx, &name, price, &now)?
     } else {
         touch_product(&tx, &name, price, &now)?
     };
@@ -655,7 +702,9 @@ pub fn day_end_page(conn: &Connection) -> R<DayEndPageDTO> {
     } else {
         DayEndDTO { deliveries: merge_roster(&active_roster(conn)?, &base.deliveries), ..base }
     };
-    Ok(DayEndPageDTO { transactions: transactions_for_date(conn, &date)?, day_end, date })
+    // A finalized day shows what was saved; an open day has a sheet for every active delivery boy.
+    let sales = if day_end.is_finalized { sales_for_date(conn, &date)? } else { sales_sheet(conn, &date)? };
+    Ok(DayEndPageDTO { transactions: transactions_for_date(conn, &date)?, day_end, sales, date })
 }
 
 #[derive(Deserialize)]
@@ -975,6 +1024,347 @@ pub fn finalize_day(conn: &mut Connection, input: DayEndInput) -> R<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Delivery boy sales (Day End page): per delivery boy per day, what he sold, the money he
+// reported (cash / online / system, for all his sales together) and what he spent from it.
+// One row per delivery boy per day, shared by the office's PCs; the last change wins.
+// ---------------------------------------------------------------------------------------------
+
+/// Offered on every card even before they've been used.
+const STARTER_EXPENSES: [&str; 2] = ["Fuel", "Service"];
+const EXPENSE_NAME_MAX: usize = 40;
+const SALES_LINES_MAX: usize = 10;
+const SYSTEM_LINES_MAX: usize = 50;
+const MONEY_INVALID: &str = "Enter amounts as numbers, like 1500 or 1500.50.";
+const SOLD_INVALID: &str = "Quantity sold must be a whole number up to 9999.";
+
+pub fn sales_id(date: &str, boy_id: &str) -> String {
+    format!("{date}:{boy_id}")
+}
+
+/// Empty -> 0; otherwise a non-negative amount, rounded to paise.
+fn parse_money(v: &Value) -> R<f64> {
+    let n = match v {
+        Value::Null => return Ok(0.0),
+        Value::String(s) if s.trim().is_empty() => return Ok(0.0),
+        Value::String(s) => s.trim().parse::<f64>().map_err(|_| MONEY_INVALID.to_string())?,
+        Value::Number(n) => n.as_f64().ok_or(MONEY_INVALID)?,
+        _ => return Err(MONEY_INVALID.into()),
+    };
+    if !n.is_finite() || !(0.0..=MAX_PRICE).contains(&n) {
+        return Err(MONEY_INVALID.into());
+    }
+    Ok((n * 100.0).round() / 100.0)
+}
+
+/// Empty -> 0; otherwise a whole number from 0 to QUANTITY_MAX.
+fn parse_sold(v: &Value) -> R<i64> {
+    let n = match v {
+        Value::Null => return Ok(0),
+        Value::String(s) if s.trim().is_empty() => return Ok(0),
+        Value::String(s) => s.trim().parse::<i64>().map_err(|_| SOLD_INVALID.to_string())?,
+        Value::Number(n) => n.as_i64().ok_or(SOLD_INVALID)?,
+        _ => return Err(SOLD_INVALID.into()),
+    };
+    if (0..=QUANTITY_MAX).contains(&n) {
+        Ok(n)
+    } else {
+        Err(SOLD_INVALID.into())
+    }
+}
+
+const SALES_COLS: &str =
+    "delivery_boy_id, delivery_boy_name, products, cash, online, system, expenses, updated_by_user, updated_at, system_payments";
+
+fn sales_from_row(r: &Row) -> rusqlite::Result<DeliverySalesDTO> {
+    Ok(DeliverySalesDTO {
+        delivery_boy_id: r.get(0)?,
+        delivery_boy_name: r.get(1)?,
+        products: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
+        cash: r.get(3)?,
+        online: r.get(4)?,
+        system: r.get(5)?,
+        system_payments: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+        expenses: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+        usual_product: None,
+        updated_by_user: r.get(7)?,
+        updated_at: Some(r.get(8)?),
+    })
+}
+
+/// What was saved for a day, by delivery boy name.
+pub fn sales_for_date(conn: &Connection, date: &str) -> R<Vec<DeliverySalesDTO>> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {SALES_COLS} FROM delivery_sales WHERE date_string = ?1 ORDER BY delivery_boy_name COLLATE NOCASE"
+        ))
+        .map_err(db_err)?;
+    let rows = stmt.query_map([date], sales_from_row).map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
+/// The product a delivery boy sold most recently before `date`: offered first on his card.
+fn usual_product(conn: &Connection, boy_id: &str, date: &str) -> R<Option<String>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT products FROM delivery_sales WHERE delivery_boy_id = ?1 AND date_string < ?2
+             ORDER BY date_string DESC LIMIT 30",
+        )
+        .map_err(db_err)?;
+    let rows = stmt.query_map(params![boy_id, date], |r| r.get::<_, String>(0)).map_err(db_err)?;
+    for products in rows {
+        let products: Vec<SoldProduct> = serde_json::from_str(&products.map_err(db_err)?).unwrap_or_default();
+        if let Some(p) = products.into_iter().find(|p| p.quantity > 0) {
+            return Ok(Some(p.name));
+        }
+    }
+    Ok(None)
+}
+
+/// An open day's sheet: every active delivery boy (blank until something is typed), plus anyone
+/// already saved today who was deactivated since.
+fn sales_sheet(conn: &Connection, date: &str) -> R<Vec<DeliverySalesDTO>> {
+    let mut saved: HashMap<String, DeliverySalesDTO> =
+        sales_for_date(conn, date)?.into_iter().map(|s| (s.delivery_boy_id.clone(), s)).collect();
+    let mut sheet = Vec::new();
+    for (id, name) in active_roster(conn)? {
+        let row = saved.remove(&id).unwrap_or_else(|| DeliverySalesDTO {
+            delivery_boy_id: id.clone(),
+            delivery_boy_name: String::new(),
+            products: vec![],
+            cash: 0.0,
+            online: 0.0,
+            system: 0.0,
+            system_payments: vec![],
+            expenses: vec![],
+            usual_product: None,
+            updated_by_user: None,
+            updated_at: None,
+        });
+        sheet.push(DeliverySalesDTO { delivery_boy_name: name, ..row }); // current name after a rename
+    }
+    sheet.extend(saved.into_values());
+    for row in &mut sheet {
+        row.usual_product = usual_product(conn, &row.delivery_boy_id, date)?;
+    }
+    sheet.sort_by_key(|r| r.delivery_boy_name.to_lowercase());
+    Ok(sheet)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoldInput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub quantity: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpenseInput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub amount: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPaymentInput {
+    #[serde(default)]
+    pub consumer_no: Value,
+    #[serde(default)]
+    pub name: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesInput {
+    pub delivery_boy_id: String,
+    #[serde(default)]
+    pub products: Vec<SoldInput>,
+    #[serde(default)]
+    pub cash: Value,
+    #[serde(default)]
+    pub online: Value,
+    /// One line per system payment; the System total is their sum.
+    #[serde(default)]
+    pub system_payments: Vec<SystemPaymentInput>,
+    #[serde(default)]
+    pub expenses: Vec<ExpenseInput>,
+}
+
+/// Save one delivery boy's sheet for today, as typed. Rows the operator is still filling in are
+/// kept (a product without a quantity yet, an expense without an amount yet).
+pub fn save_delivery_sales(conn: &mut Connection, input: SalesInput) -> R<DeliverySalesDTO> {
+    if input.products.len() > SALES_LINES_MAX || input.expenses.len() > SALES_LINES_MAX {
+        return Err(format!("Up to {SALES_LINES_MAX} products and {SALES_LINES_MAX} expenses per delivery boy."));
+    }
+    if input.system_payments.len() > SYSTEM_LINES_MAX {
+        return Err(format!("Up to {SYSTEM_LINES_MAX} system payments per delivery boy."));
+    }
+    let mut products = Vec::new();
+    for p in &input.products {
+        let (name, quantity) = (clean_name(&p.name), parse_sold(&p.quantity)?);
+        if name.is_empty() && quantity == 0 {
+            continue;
+        }
+        if name.is_empty() {
+            return Err("Enter the product name for each quantity sold.".into());
+        }
+        products.push(SoldProduct { name, quantity });
+    }
+    let mut expenses = Vec::new();
+    for e in &input.expenses {
+        let name: String = clean_name(&e.name).chars().take(EXPENSE_NAME_MAX).collect::<String>().trim_end().to_string();
+        let amount = parse_money(&e.amount)?;
+        if name.is_empty() && amount == 0.0 {
+            continue;
+        }
+        if name.is_empty() {
+            return Err("Enter what each expense was for (fuel, service…).".into());
+        }
+        expenses.push(Expense { name, amount });
+    }
+    // System payments: consumer number and optional name; the amount is the fixed System price.
+    let mut system_lines = Vec::new();
+    for p in &input.system_payments {
+        let consumer_no = parse_consumer_no(&p.consumer_no)
+            .map_err(|_| "System payment: the consumer number must be exactly 6 digits.".to_string())?;
+        let name = parse_other_note(&p.name).map_err(|_| "Enter the consumer's name as text.".to_string())?;
+        match consumer_no {
+            Some(c) => system_lines.push((c, name)),
+            None if name.is_none() => {} // a blank line
+            None => return Err("Enter the 6-digit consumer number for each system payment.".into()),
+        }
+    }
+    let (cash, online) = (parse_money(&input.cash)?, parse_money(&input.online)?);
+    let price_now = system_price(conn)?;
+
+    let date = time::today();
+    let tx = conn.transaction().map_err(db_err)?;
+    if is_day_finalized(&tx, &date)? {
+        return Err("Today is finalized. Delivery boy sales can no longer be changed.".into());
+    }
+    let id = sales_id(&date, &input.delivery_boy_id);
+    let existing = tx
+        .query_row(&format!("SELECT {SALES_COLS} FROM delivery_sales WHERE id = ?1"), [&id], sales_from_row)
+        .optional()
+        .map_err(db_err)?;
+    let active: Option<String> = tx
+        .query_row("SELECT name FROM delivery_boys WHERE id = ?1 AND is_active = 1", [&input.delivery_boy_id], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    let name = active
+        .or_else(|| existing.as_ref().map(|e| e.delivery_boy_name.clone()))
+        .ok_or("This delivery boy is no longer on the list. Reload the page.")?;
+    // Lines saved before keep the price they were saved with; new lines take today's price.
+    let mut earlier: Vec<SystemPayment> = existing.as_ref().map(|e| e.system_payments.clone()).unwrap_or_default();
+    let mut system_payments = Vec::new();
+    for (consumer_no, consumer_name) in system_lines {
+        let amount = match earlier.iter().position(|p| p.consumer_no == consumer_no) {
+            Some(i) => earlier.remove(i).amount,
+            None => price_now.ok_or(SYSTEM_PRICE_MISSING)?,
+        };
+        system_payments.push(SystemPayment { consumer_no, name: consumer_name, amount });
+    }
+    let system = (system_payments.iter().map(|p| p.amount).sum::<f64>() * 100.0).round() / 100.0;
+
+    if let Some(e) = existing.as_ref().filter(|e| {
+        e.delivery_boy_name == name
+            && e.products == products
+            && e.expenses == expenses
+            && e.system_payments == system_payments
+            && (e.cash, e.online) == (cash, online)
+    }) {
+        return Ok(e.clone()); // nothing changed: nothing to upload
+    }
+    let user = user_name(&tx)?;
+    let now = time::now_iso();
+    let (products_json, expenses_json) = (
+        serde_json::to_string(&products).unwrap_or_default(),
+        serde_json::to_string(&expenses).unwrap_or_default(),
+    );
+    tx.execute(
+        "INSERT INTO delivery_sales (id, date_string, delivery_boy_id, delivery_boy_name, products, cash, online, system,
+                                     expenses, updated_by_user, created_at, updated_at, system_payments)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET delivery_boy_name = excluded.delivery_boy_name, products = excluded.products,
+             cash = excluded.cash, online = excluded.online, system = excluded.system, expenses = excluded.expenses,
+             system_payments = excluded.system_payments,
+             updated_by_user = excluded.updated_by_user, updated_at = excluded.updated_at, version = version + 1",
+        params![
+            id, date, input.delivery_boy_id, name, products_json, cash, online, system, expenses_json, user, now,
+            serde_json::to_string(&system_payments).unwrap_or_default()
+        ],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(DeliverySalesDTO {
+        delivery_boy_id: input.delivery_boy_id,
+        delivery_boy_name: name,
+        products,
+        cash,
+        online,
+        system,
+        system_payments,
+        expenses,
+        usual_product: None,
+        updated_by_user: user,
+        updated_at: Some(now),
+    })
+}
+
+/// Names for the delivery boy cards: everything sold or spent on before (most used first), plus
+/// the register's product catalog and the starter expense names.
+pub fn sales_suggestions(conn: &Connection) -> R<SalesSuggestions> {
+    // lowercase name -> (spelling first seen, times used)
+    type Tally = HashMap<String, (String, usize)>;
+    let add = |t: &mut Tally, name: &str, n: usize| {
+        let name = name.trim();
+        if !name.is_empty() {
+            t.entry(name.to_lowercase()).or_insert_with(|| (name.to_string(), 0)).1 += n;
+        }
+    };
+    let (mut products, mut expenses) = (Tally::new(), Tally::new());
+    // consumer number -> name, newest first
+    let mut consumers: Vec<KnownConsumer> = Vec::new();
+    let mut stmt = conn
+        .prepare_cached("SELECT products, expenses, system_payments FROM delivery_sales ORDER BY date_string DESC, updated_at DESC")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .map_err(db_err)?;
+    for row in rows {
+        let (p, e, sp) = row.map_err(db_err)?;
+        for sp in serde_json::from_str::<Vec<SystemPayment>>(&sp).unwrap_or_default() {
+            if let Some(name) = sp.name.filter(|_| !consumers.iter().any(|c| c.consumer_no == sp.consumer_no)) {
+                consumers.push(KnownConsumer { consumer_no: sp.consumer_no, name });
+            }
+        }
+        for p in serde_json::from_str::<Vec<SoldProduct>>(&p).unwrap_or_default() {
+            add(&mut products, &p.name, 1);
+        }
+        for e in serde_json::from_str::<Vec<Expense>>(&e).unwrap_or_default() {
+            add(&mut expenses, &e.name, 1);
+        }
+    }
+    let mut stmt = conn.prepare_cached("SELECT name FROM products").map_err(db_err)?;
+    for name in stmt.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)? {
+        add(&mut products, &name.map_err(db_err)?, 0);
+    }
+    for name in STARTER_EXPENSES {
+        add(&mut expenses, name, 0);
+    }
+    let ranked = |t: Tally| {
+        let mut v: Vec<(String, usize)> = t.into_values().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        v.into_iter().map(|(name, _)| name).collect()
+    };
+    Ok(SalesSuggestions { products: ranked(products), expenses: ranked(expenses), consumers })
+}
+
+// ---------------------------------------------------------------------------------------------
 // Changes from the other PCs of the office (downloaded by the sync worker)
 // ---------------------------------------------------------------------------------------------
 // Every row keeps its newest version (by its last change time). What comes from the cloud is
@@ -1106,6 +1496,34 @@ pub fn apply_remote_day(tx: &Transaction, remote: &DayCopy) -> R<bool> {
     }
 }
 
+/// A delivery boy's sheet from the cloud. Returns true when this PC's data changed.
+pub fn apply_remote_sales(tx: &Transaction, date: &str, s: &DeliverySalesDTO, created_at: &str, updated_at: &str) -> R<bool> {
+    let id = sales_id(date, &s.delivery_boy_id);
+    let local: Option<String> = tx
+        .query_row("SELECT updated_at FROM delivery_sales WHERE id = ?1", [&id], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    if local.as_deref().is_some_and(|l| !newer(updated_at, l)) {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO delivery_sales (id, date_string, delivery_boy_id, delivery_boy_name, products, cash, online, system,
+                                     expenses, updated_by_user, created_at, updated_at, system_payments, version, synced_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, 1)
+         ON CONFLICT(id) DO UPDATE SET delivery_boy_name = excluded.delivery_boy_name, products = excluded.products,
+             cash = excluded.cash, online = excluded.online, system = excluded.system, expenses = excluded.expenses,
+             system_payments = excluded.system_payments, updated_by_user = excluded.updated_by_user, updated_at = excluded.updated_at, synced_version = version",
+        params![
+            id, date, s.delivery_boy_id, s.delivery_boy_name,
+            serde_json::to_string(&s.products).unwrap_or_default(), s.cash, s.online, s.system,
+            serde_json::to_string(&s.expenses).unwrap_or_default(), s.updated_by_user, created_at, updated_at,
+            serde_json::to_string(&s.system_payments).unwrap_or_default()
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(true)
+}
+
 pub struct MachineInfo<'a> {
     pub id: &'a str,
     pub device_name: &'a str,
@@ -1172,7 +1590,9 @@ pub fn pending_count(conn: &Connection) -> R<i64> {
         "SELECT (SELECT COUNT(*) FROM transactions  WHERE version > synced_version)
               + (SELECT COUNT(*) FROM day_end_logs  WHERE version > synced_version)
               + (SELECT COUNT(*) FROM products      WHERE version > synced_version)
-              + (SELECT COUNT(*) FROM delivery_boys WHERE version > synced_version)",
+              + (SELECT COUNT(*) FROM delivery_boys WHERE version > synced_version)
+              + (SELECT COUNT(*) FROM delivery_sales WHERE version > synced_version)
+              + (SELECT COUNT(*) FROM office_settings WHERE version > synced_version)",
         [],
         |r| r.get(0),
     )
@@ -1186,6 +1606,9 @@ pub fn prune(conn: &Connection, cutoff: &str) -> R<usize> {
         .map_err(db_err)?
         + conn
             .execute("DELETE FROM day_end_logs WHERE date_string < ?1 AND version <= synced_version", [cutoff])
+            .map_err(db_err)?
+        + conn
+            .execute("DELETE FROM delivery_sales WHERE date_string < ?1 AND version <= synced_version", [cutoff])
             .map_err(db_err)?;
     if n > 0 {
         crate::db::incremental_vacuum(conn).map_err(db_err)?;
@@ -1299,8 +1722,21 @@ mod tests {
         assert_eq!(make(&mut c, json!(null)).unwrap().payment_mode, "CASH");
         assert_eq!(make(&mut c, json!("online")).unwrap().payment_mode, "ONLINE");
         assert!(make(&mut c, json!("CHEQUE")).is_err());
+        // A System Cash In takes the fixed System price from Settings, whatever was typed.
+        assert_eq!(make(&mut c, json!("SYSTEM")).unwrap_err(), SYSTEM_PRICE_MISSING);
+        assert!(set_system_price(&c, &json!("0")).is_err());
+        set_system_price(&c, &json!("250")).unwrap();
         let t = make(&mut c, json!("SYSTEM")).unwrap();
-        assert_eq!(t.audit_log[0].new_payment_mode.as_deref(), Some("SYSTEM"));
+        assert_eq!((t.price, t.audit_log[0].new_payment_mode.as_deref()), (250.0, Some("SYSTEM")));
+        // ...without making it the product's ghost price.
+        assert_eq!(search_products(&c, "Refill").unwrap()[0].last_used_price, 900.0);
+        // A System Cash Out keeps its typed price.
+        let sys_out = create_transaction(
+            &mut c,
+            serde_json::from_value(json!({"type":"CASH_OUT","productName":"Diesel","price":500,"paymentMode":"SYSTEM"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sys_out.price, 500.0);
         let out = create_transaction(
             &mut c,
             serde_json::from_value(json!({"type":"CASH_OUT","productName":"Diesel","price":500,"paymentMode":"ONLINE"})).unwrap(),
@@ -1309,66 +1745,186 @@ mod tests {
         assert_eq!(out.payment_mode, "ONLINE");
 
         let update = |c: &mut Connection, body: Value| update_transaction(c, serde_json::from_value(body).unwrap());
-        // Leaving paymentMode out keeps it; changing only the payment type is a real, audited edit.
-        update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456"})).unwrap();
-        update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"CASH"})).unwrap();
+        // Leaving paymentMode out keeps it (a System entry keeps its fixed price even if the price
+        // changes in Settings); changing only the payment type is a real, audited edit.
+        set_system_price(&c, &json!(300)).unwrap();
+        update(&mut c, json!({"id":t.id,"productName":"Refill 14kg","price":950,"consumerNo":"123456"})).unwrap();
+        let row = transactions_for_date(&c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!((row.payment_mode.as_str(), row.price), ("SYSTEM", 250.0));
+        update(&mut c, json!({"id":t.id,"productName":"Refill 14kg","price":950,"consumerNo":"123456","paymentMode":"CASH"})).unwrap();
         let row = transactions_for_date(&c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
         assert_eq!((row.payment_mode.as_str(), row.price, row.audit_log.len()), ("CASH", 950.0, 3));
         assert_eq!(row.audit_log[1].new_payment_mode.as_deref(), Some("SYSTEM"));
         assert_eq!((row.audit_log[2].previous_payment_mode.as_deref(), row.audit_log[2].new_payment_mode.as_deref()), (Some("SYSTEM"), Some("CASH")));
+        // Back to System: today's fixed price.
+        update(&mut c, json!({"id":t.id,"productName":"Refill 14kg","price":950,"consumerNo":"123456","paymentMode":"SYSTEM"})).unwrap();
+        let row = transactions_for_date(&c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!(row.price, 300.0);
         assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"bad"})).is_err());
     }
 
     #[test]
-    fn delivery_boy_entries_and_operator_name() {
+    fn operator_name_and_old_delivery_boy_entries() {
         let mut c = mem();
         crate::db::meta_set(&c, "machine_id", "PC-A").unwrap();
         assert_eq!(set_user_name(&c, "  Tanuj   B ").unwrap().as_deref(), Some("Tanuj B"));
-        let boy = add_delivery_boy(&c, "Suresh").unwrap();
         let make = |c: &mut Connection, body: Value| create_transaction(c, serde_json::from_value(body).unwrap());
 
-        // A delivery boy's Cash In takes a quantity instead of the consumer number.
-        let base = json!({"type":"CASH_IN","productName":"Refill","price":1800,"roleId":boy.id});
-        let with = |extra: Value| {
-            let mut b = base.clone();
-            b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            b
-        };
-        assert_eq!(make(&mut c, base.clone()).unwrap_err(), QUANTITY_REQUIRED);
-        assert_eq!(make(&mut c, with(json!({"quantity":"0"}))).unwrap_err(), QUANTITY_INVALID);
-        assert_eq!(make(&mut c, with(json!({"quantity":"2.5"}))).unwrap_err(), QUANTITY_INVALID);
-        let t = make(&mut c, with(json!({"quantity":"2","consumerNo":"123456"}))).unwrap();
-        assert_eq!((t.role_name.as_deref(), t.quantity, t.consumer_no.as_deref()), (Some("Suresh"), Some(2), None));
+        // The Role box is gone: a role sent by an old screen is ignored, the consumer number is required again.
+        let t = make(&mut c, json!({"type":"CASH_IN","productName":"Refill","price":900,"consumerNo":"123456","roleId":"x","quantity":3})).unwrap();
+        assert_eq!((t.role_id.as_deref(), t.quantity, t.consumer_no.as_deref()), (None, None, Some("123456")));
         assert_eq!((t.created_by_user.as_deref(), t.audit_log[0].user.as_deref()), (Some("Tanuj B"), Some("Tanuj B")));
         assert_eq!(t.audit_log[0].machine_id.as_deref(), Some("PC-A"));
-        // Other product: the quantity is optional.
-        let other = make(&mut c, with(json!({"isOtherProduct":true}))).unwrap();
-        assert_eq!(other.quantity, None);
-        // Office entries are unchanged: consumer number, no quantity.
-        let office = make(&mut c, json!({"type":"CASH_IN","productName":"Refill","price":900,"consumerNo":"123456","quantity":5})).unwrap();
-        assert_eq!((office.role_id, office.quantity), (None, None));
-        // Cash Out for a delivery boy: no quantity needed.
-        let out = make(&mut c, json!({"type":"CASH_OUT","productName":"Diesel","price":200,"roleId":boy.id})).unwrap();
-        assert_eq!((out.role_name.as_deref(), out.quantity), (Some("Suresh"), None));
-        assert!(make(&mut c, json!({"type":"CASH_IN","productName":"X","price":1,"roleId":"nope","quantity":1})).is_err());
+        assert_eq!(make(&mut c, json!({"type":"CASH_IN","productName":"Refill","price":900,"quantity":3})).unwrap_err(), CONSUMER_REQUIRED);
 
-        // Edits by another operator name are recorded with that name.
+        // An entry made for a delivery boy with v1.6–1.7 keeps its quantity, which stays editable.
+        let boy = add_delivery_boy(&c, "Suresh").unwrap();
+        c.execute(
+            "INSERT INTO transactions (id, date_string, type, product_name, price, status, audit_log, created_at, updated_at,
+                                       role_id, role_name, quantity, created_by_user)
+             VALUES ('old', ?1, 'CASH_IN', 'Refill', 1800, 'ACTIVE', '[]', ?2, ?2, ?3, 'Suresh', 2, 'Tanuj B')",
+            params![time::today(), time::now_iso(), boy.id],
+        )
+        .unwrap();
         set_user_name(&c, "Ravi").unwrap();
         let update = |c: &mut Connection, body: Value| update_transaction(c, serde_json::from_value(body).unwrap());
-        assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":1800})).is_err());
-        update(&mut c, json!({"id":t.id,"productName":"Refill","price":1800,"quantity":3})).unwrap();
-        delete_transaction(&mut c, &other.id).unwrap();
+        assert!(update(&mut c, json!({"id":"old","productName":"Refill","price":1800})).is_err());
+        update(&mut c, json!({"id":"old","productName":"Refill","price":1800,"quantity":3})).unwrap();
+        delete_transaction(&mut c, &t.id).unwrap();
         let rows = transactions_for_date(&c, &time::today()).unwrap();
-        let row = rows.iter().find(|r| r.id == t.id).unwrap();
-        assert_eq!((row.quantity, row.audit_log[1].previous_quantity, row.audit_log[1].user.as_deref()), (Some(3), Some(2), Some("Ravi")));
-        assert_eq!((row.created_by_user.as_deref(), row.updated_by_user.as_deref()), (Some("Tanuj B"), Some("Ravi")));
-        let gone = rows.iter().find(|r| r.id == other.id).unwrap();
+        let old = rows.iter().find(|r| r.id == "old").unwrap();
+        assert_eq!((old.quantity, old.audit_log[0].previous_quantity, old.audit_log[0].user.as_deref()), (Some(3), Some(2), Some("Ravi")));
+        assert_eq!((old.created_by_user.as_deref(), old.updated_by_user.as_deref()), (Some("Tanuj B"), Some("Ravi")));
+        let gone = rows.iter().find(|r| r.id == t.id).unwrap();
         assert_eq!((gone.status.as_str(), gone.audit_log[1].user.as_deref()), ("DELETED", Some("Ravi")));
 
         // Without a name, changes still say which PC made them.
         set_user_name(&c, "   ").unwrap();
-        let anon = make(&mut c, with(json!({"quantity":1}))).unwrap();
+        let anon = make(&mut c, json!({"type":"CASH_OUT","productName":"Tea","price":20})).unwrap();
         assert_eq!((anon.created_by_user, anon.audit_log[0].machine_id.as_deref()), (None, Some("PC-A")));
+    }
+
+    #[test]
+    fn delivery_boy_sales_sheet() {
+        let mut c = mem();
+        set_user_name(&c, "Tanuj").unwrap();
+        let suresh = add_delivery_boy(&c, "Suresh").unwrap();
+        let ramesh = add_delivery_boy(&c, "Ramesh").unwrap();
+        let save = |c: &mut Connection, body: Value| save_delivery_sales(c, serde_json::from_value(body).unwrap());
+
+        // Every active delivery boy has a blank sheet; nothing is stored until something is typed.
+        let page = day_end_page(&c).unwrap();
+        assert_eq!(page.sales.iter().map(|s| s.delivery_boy_name.as_str()).collect::<Vec<_>>(), ["Ramesh", "Suresh"]);
+        assert!(page.sales.iter().all(|s| s.updated_at.is_none() && s.usual_product.is_none()));
+
+        let line = |c: &mut Connection| save(c, json!({"deliveryBoyId":suresh.id,"systemPayments":[{"consumerNo":"123456"}]}));
+        assert_eq!(line(&mut c).unwrap_err(), SYSTEM_PRICE_MISSING);
+        set_system_price(&c, &json!(900)).unwrap();
+        let saved = save(
+            &mut c,
+            json!({"deliveryBoyId":suresh.id,
+                   "products":[{"name":" Refill  14.2kg ","quantity":"12"},{"name":"","quantity":""},{"name":"Refill 19kg","quantity":""}],
+                   "cash":"10500.5","online":"2400",
+                   "systemPayments":[{"consumerNo":"123-456","name":"  Anil  Kumar ","amount":"900"},{"consumerNo":"654321","amount":"450.5"},
+                                     {"consumerNo":"","name":"","amount":""}],
+                   "expenses":[{"name":"  Fuel ","amount":"200"},{"name":"Tyre puncture","amount":""},{"name":"","amount":""}]}),
+        )
+        .unwrap();
+        // Blank lines dropped; a product still waiting for its quantity is kept.
+        assert_eq!(
+            saved.products,
+            vec![SoldProduct { name: "Refill 14.2kg".into(), quantity: 12 }, SoldProduct { name: "Refill 19kg".into(), quantity: 0 }]
+        );
+        // System lines take the fixed price (an amount sent along is ignored).
+        assert_eq!((saved.cash, saved.online, saved.system), (10500.5, 2400.0, 1800.0));
+        assert_eq!(
+            saved.system_payments,
+            vec![
+                SystemPayment { consumer_no: "123456".into(), name: Some("Anil Kumar".into()), amount: 900.0 },
+                SystemPayment { consumer_no: "654321".into(), name: None, amount: 900.0 },
+            ]
+        );
+        // A blank expense row is dropped; one still waiting for its amount is kept.
+        assert_eq!(
+            saved.expenses,
+            vec![Expense { name: "Fuel".into(), amount: 200.0 }, Expense { name: "Tyre puncture".into(), amount: 0.0 }]
+        );
+        assert_eq!(saved.updated_by_user.as_deref(), Some("Tanuj"));
+        let pending = pending_count(&c).unwrap();
+        // Saving the same sheet again changes nothing (nothing to upload).
+        save(
+            &mut c,
+            json!({"deliveryBoyId":suresh.id,"products":[{"name":"Refill 14.2kg","quantity":12},{"name":"Refill 19kg","quantity":0}],
+                   "cash":10500.5,"online":2400,"expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
+                   "systemPayments":[{"consumerNo":"123456","name":"Anil Kumar","amount":900},{"consumerNo":"654321","amount":450.5}]}),
+        )
+        .unwrap();
+        let version: i64 = c.query_row("SELECT version FROM delivery_sales", [], |r| r.get(0)).unwrap();
+        assert_eq!((pending_count(&c).unwrap(), version), (pending, 1));
+
+        // A new price in Settings: lines already saved keep theirs, a new line takes the new one.
+        set_system_price(&c, &json!(1000)).unwrap();
+        let more = save(
+            &mut c,
+            json!({"deliveryBoyId":suresh.id,"products":[{"name":"Refill 14.2kg","quantity":12},{"name":"Refill 19kg","quantity":0}],
+                   "cash":10500.5,"online":2400,"expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
+                   "systemPayments":[{"consumerNo":"123456","name":"Anil Kumar"},{"consumerNo":"654321"},{"consumerNo":"111111"}]}),
+        )
+        .unwrap();
+        assert_eq!(more.system_payments.iter().map(|p| p.amount).collect::<Vec<_>>(), [900.0, 900.0, 1000.0]);
+        assert_eq!(more.system, 2800.0);
+
+        // Bad input is refused with a message.
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"","quantity":3}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"cash":"-5"})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"X","quantity":"1.5"}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"expenses":[{"name":" ","amount":5}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"systemPayments":[{"consumerNo":"","name":"Anil"}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"systemPayments":[{"consumerNo":"12345"}]})).is_err());
+
+        // What was typed is offered next time: used names first, then the catalog / starter names.
+        cash_in(&mut c, "Regulator", json!(350), "123456").unwrap();
+        let s = sales_suggestions(&c).unwrap();
+        assert_eq!(s.products, ["Refill 14.2kg", "Refill 19kg", "Regulator"]);
+        assert_eq!(s.expenses, ["Fuel", "Tyre puncture", "Service"]);
+        assert_eq!(s.consumers.iter().map(|c| (c.consumer_no.as_str(), c.name.as_str())).collect::<Vec<_>>(), [("123456", "Anil Kumar")]);
+        assert!(save(&mut c, json!({"deliveryBoyId":"nobody","cash":5})).is_err());
+
+        // Tomorrow, his card offers the product he sold last.
+        c.execute("UPDATE delivery_sales SET date_string = '2000-01-01', id = '2000-01-01:' || delivery_boy_id", []).unwrap();
+        let page = day_end_page(&c).unwrap();
+        let s = page.sales.iter().find(|s| s.delivery_boy_id == suresh.id).unwrap();
+        assert_eq!((s.usual_product.as_deref(), s.updated_at.as_deref()), (Some("Refill 14.2kg"), None));
+
+        // A sheet from another PC: newer wins, older is ignored.
+        let remote = |name: &str, cash: f64| DeliverySalesDTO {
+            delivery_boy_id: ramesh.id.clone(),
+            delivery_boy_name: name.into(),
+            products: vec![SoldProduct { name: "Refill 14.2kg".into(), quantity: 4 }],
+            cash,
+            online: 0.0,
+            system: 0.0,
+            system_payments: vec![],
+            expenses: vec![],
+            usual_product: None,
+            updated_by_user: Some("Ravi".into()),
+            updated_at: None,
+        };
+        let today = time::today();
+        let tx = c.transaction().unwrap();
+        assert!(apply_remote_sales(&tx, &today, &remote("Ramesh", 3600.0), "2026-01-01T10:00:00.000Z", "2026-01-01T10:00:00.000Z").unwrap());
+        assert!(!apply_remote_sales(&tx, &today, &remote("Ramesh", 1.0), "2026-01-01T09:00:00.000Z", "2026-01-01T09:00:00.000Z").unwrap());
+        tx.commit().unwrap();
+        let r = sales_for_date(&c, &today).unwrap();
+        assert_eq!((r.len(), r[0].cash, r[0].updated_by_user.as_deref()), (1, 3600.0, Some("Ravi")));
+        // Rows from the cloud are not uploaded back.
+        let unsynced: i64 = c.query_row("SELECT COUNT(*) FROM delivery_sales WHERE version > synced_version AND date_string = ?1", [&today], |r| r.get(0)).unwrap();
+        assert_eq!(unsynced, 0);
+
+        // Once the day is finalized, sheets are locked.
+        finalize_day(&mut c, serde_json::from_value(json!({})).unwrap()).unwrap();
+        assert!(save(&mut c, json!({"deliveryBoyId":ramesh.id,"cash":1})).is_err());
+        assert_eq!(day_end_page(&c).unwrap().sales.len(), 1); // finalized: only what was saved
     }
 
     #[test]

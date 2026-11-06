@@ -4,10 +4,11 @@ import { mutate } from "@/lib/api";
 import { formatDateTime, formatLongDate, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
 import { PAYMENT_LABEL } from "@/lib/payment";
-import type { CylinderStockDTO, DayEndDTO, Totals } from "@/lib/types";
+import type { CylinderStockDTO, DayEndDTO, DeliverySalesDTO, Totals } from "@/lib/types";
 import { Card, STOCK_ROWS, StockView } from "./DayEndViews";
+import { DeliverySalesSection, DeliverySalesView, summarizeSaved, type SalesSummary } from "./DeliverySales";
 
-type Props = { initial: DayEndDTO; totals: Totals };
+type Props = { initial: DayEndDTO; totals: Totals; sales: DeliverySalesDTO[] };
 
 const numberInput =
   "tabular w-full rounded-md border border-slate-300 px-3 py-2 text-right outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20 disabled:bg-slate-50";
@@ -23,13 +24,16 @@ const toCount = (v: string) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-export function DayEndForm({ initial, totals }: Props) {
+export function DayEndForm({ initial, totals, sales }: Props) {
   const [stock, setStock] = useState<CylinderStockDTO>(initial.cylinderStock);
   const [saveState, setSaveState] = useState<"idle" | "waiting" | "saving" | "saved" | "failed">("idle");
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [pending, startTransition] = useTransition();
+  // Delivery boy cards save themselves; Finalize first waits for any typing still to be saved.
+  const salesFlushers = useRef(new Set<() => Promise<void>>());
+  const [salesSummary, setSalesSummary] = useState<SalesSummary>(() => summarizeSaved(sales));
 
   // ---- Auto-save: every change is saved shortly after the operator stops typing ----
   const edited = useRef(false); // nothing to save until the operator changes something
@@ -124,6 +128,7 @@ export function DayEndForm({ initial, totals }: Props) {
             {initial.finalizedAt ? ` at ${formatDateTime(initial.finalizedAt)}` : ""}. All entries are locked.
           </p>
         </div>
+        <DeliverySalesView sales={sales} />
         <StockView stock={initial.cylinderStock} />
       </div>
     );
@@ -138,7 +143,7 @@ export function DayEndForm({ initial, totals }: Props) {
     startTransition(async () => {
       // Finalize saves these same numbers, so drop the waiting auto-save and let any running one finish.
       unsaved.current = null;
-      await queue.current;
+      await Promise.all([queue.current, ...[...salesFlushers.current].map((f) => f())]);
       const res = await mutate("finalize_day", { cylinderStock: stock, base: baseline.current });
       if (res.ok) {
         setConfirming(false);
@@ -167,6 +172,8 @@ export function DayEndForm({ initial, totals }: Props) {
           {error}
         </p>
       )}
+
+      <DeliverySalesSection sales={sales} flushers={salesFlushers} onSummary={setSalesSummary} />
 
       <Card title="Cylinder Stock Count" icon={Cylinder}>
         <div className="grid gap-4 p-4 md:grid-cols-3">
@@ -211,6 +218,7 @@ export function DayEndForm({ initial, totals }: Props) {
         <ConfirmFinalize
           date={initial.dateString}
           totals={totals}
+          sales={salesSummary}
           pending={pending}
           onCancel={() => setConfirming(false)}
           onConfirm={doFinalize}
@@ -239,6 +247,7 @@ function SaveStatus({ state, savedAt }: { state: "idle" | "waiting" | "saving" |
 function ConfirmFinalize(props: {
   date: string;
   totals: Totals;
+  sales: SalesSummary;
   pending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -261,6 +270,18 @@ function ConfirmFinalize(props: {
       .filter((m) => t.inByMode[m] || t.outByMode[m])
       .map((m) => [`${PAYMENT_LABEL[m]} (in − out)`, formatINR(received(m))]),
     ["Active entries", String(t.count)],
+    // Delivery boys, when any reported today.
+    ...(props.sales.boys
+      ? [
+          ["Delivery boys sold", props.sales.sold.map(([n, q]) => `${n} × ${q}`).join(", ") || "—"],
+          ["Delivery boys received", `${formatINR(props.sales.cash + props.sales.online)} (online ${formatINR(props.sales.online)})`],
+          ...(props.sales.systemCount
+            ? [[`Delivery boys system payments (${props.sales.systemCount})`, formatINR(props.sales.system)]]
+            : []),
+          ["Delivery boy expenses", formatINR(props.sales.expenses)],
+          ["Cash to collect from delivery boys", formatINR(props.sales.handOver)],
+        ]
+      : []),
   ];
 
   return (

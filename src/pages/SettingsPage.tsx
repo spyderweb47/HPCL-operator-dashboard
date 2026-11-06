@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Bike, Check, Copy, Loader2, Monitor, Pencil, Plus, RotateCcw, UserRound, UserX, X } from "lucide-react";
+import { Bike, Check, Copy, Loader2, Monitor, MonitorCheck, Pencil, Plus, RotateCcw, UserRound, UserX, X } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
-import type { AppInfoDTO, DeliveryBoyDTO, SyncStatusDTO } from "@/lib/types";
+import { formatINR } from "@/lib/format";
+import type { AppInfoDTO, DeliveryBoyDTO, OfficeSettingsDTO, SyncStatusDTO } from "@/lib/types";
 import { CloudSettings } from "@/components/CloudSettings";
 import { Card } from "@/components/DayEndViews";
 import { LoadError } from "@/components/LoadError";
@@ -16,6 +17,7 @@ export function SettingsPage() {
         <p className="text-sm text-slate-500">Saved on this PC and synced to the cloud.</p>
       </div>
       <OperatorName />
+      <SystemPrice />
       <DeliveryBoysSettings />
       <CloudSettings />
       <DeviceInfo />
@@ -83,6 +85,76 @@ function OperatorName() {
       <p className="border-t border-slate-100 px-4 py-2.5 text-sm text-slate-500">
         Shown in the cloud with every entry you add, edit or delete on this PC, so it&apos;s clear who made each change. No password
         needed.
+      </p>
+    </Card>
+  );
+}
+
+/** The fixed price of a System payment: used for every System Cash In and delivery boy system payment. */
+function SystemPrice() {
+  const { data: settings, error: loadError } = useQuery<OfficeSettingsDTO>("get_office_settings");
+  const saved = settings?.systemPrice ?? null;
+  const [price, setPrice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
+
+  // Show the saved price, also when it was changed on another PC.
+  useEffect(() => {
+    setPrice(saved ? String(saved) : "");
+  }, [saved]);
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    const res = await mutate<OfficeSettingsDTO>("set_system_price", { systemPrice: price });
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.error);
+      setFlash(null);
+      return;
+    }
+    setError(null);
+    setFlash(`Saved. New System payments are ${formatINR(res.data.systemPrice ?? 0)}.`);
+  };
+
+  return (
+    <Card
+      title="System Payment Price"
+      icon={MonitorCheck}
+      aside={<span className="text-sm text-slate-500">{saved ? `${formatINR(saved)} each` : "Not set"}</span>}
+    >
+      <form onSubmit={save} className="flex flex-wrap items-center gap-2 px-4 py-3">
+        <span className="text-slate-500">₹</span>
+        <input
+          aria-label="System payment price"
+          inputMode="decimal"
+          value={price}
+          onChange={(e) => {
+            const v = e.target.value.replace(/[^\d.]/g, "");
+            if (/^\d*\.?\d{0,2}$/.test(v)) setPrice(v);
+            setFlash(null);
+          }}
+          placeholder="e.g. 900"
+          className="tabular w-40 rounded-lg border border-slate-300 px-3 py-2 text-right outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20"
+        />
+        <button
+          type="submit"
+          disabled={busy || !price || Number(price) === saved}
+          className="flex items-center gap-1.5 rounded-lg bg-hp-blue px-4 py-2 font-semibold text-white hover:bg-hp-blue-dark disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Save
+        </button>
+        {flash && <span className="text-sm text-emerald-700">{flash}</span>}
+        {(error || loadError) && (
+          <span role="alert" className="text-sm text-red-600">
+            {error ?? loadError}
+          </span>
+        )}
+      </form>
+      <p className="border-t border-slate-100 px-4 py-2.5 text-sm text-slate-500">
+        Every System payment takes this price automatically: ticking System on a Day Register Cash In, and each system
+        payment of a delivery boy on the Day End page. Changing it affects new payments only. Shared by all the office&apos;s PCs.
       </p>
     </Card>
   );

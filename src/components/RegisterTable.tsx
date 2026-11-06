@@ -4,7 +4,8 @@ import { mutate } from "@/lib/api";
 import { formatDateTime, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
 import { PAYMENT_LABEL, PAYMENT_MODES, PAYMENT_TAG } from "@/lib/payment";
-import type { AuditEntryDTO, PaymentMode, TransactionDTO } from "@/lib/types";
+import { useQuery } from "@/lib/useQuery";
+import type { AuditEntryDTO, OfficeSettingsDTO, PaymentMode, TransactionDTO } from "@/lib/types";
 
 type Props = {
   rows: TransactionDTO[];
@@ -42,6 +43,10 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showDeleted, setShowDeleted] = useState(true);
   const [, startTransition] = useTransition();
+  // A System Cash In keeps its fixed price; one switched to System takes today's (Settings).
+  const { data: officeSettings } = useQuery<OfficeSettingsDTO>("get_office_settings");
+  const fixedPriceOf = (r: TransactionDTO) =>
+    r.type === "CASH_IN" && draftPayment === "SYSTEM" ? (r.paymentMode === "SYSTEM" ? r.price : (officeSettings?.systemPrice ?? null)) : undefined;
 
   const deletedCount = rows.filter((r) => r.status === "DELETED").length;
   // Entries from more than one operator or PC of the office: show who made each one.
@@ -135,7 +140,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
               <th className="w-12 px-4 py-2">#</th>
               <th className="w-24 px-2 py-2">Time</th>
               <th className="w-36 px-2 py-2">Type</th>
-              <th className="w-32 px-2 py-2">Consumer / Qty</th>
+              <th className="w-32 px-2 py-2">Consumer No</th>
               <th className="px-2 py-2">Product / Item</th>
               <th className="w-36 px-2 py-2 text-right">Amount</th>
               {editable && <th className="w-28 px-4 py-2 text-right">Actions</th>}
@@ -297,7 +302,17 @@ export function RegisterTable({ rows, editable, title }: Props) {
                     )}
                   </td>
                   <td className="tabular px-2 py-2 text-right">
-                    {editing ? (
+                    {editing && fixedPriceOf(r) !== undefined ? (
+                      <input
+                        readOnly
+                        aria-label="Price"
+                        title="Fixed System payment price (Settings)"
+                        value={fixedPriceOf(r)?.toFixed(2) ?? ""}
+                        placeholder="Set in Settings"
+                        onKeyDown={(e) => onEditKeyDown(e, r)}
+                        className="w-28 rounded border border-orange-300 bg-orange-50 px-2 py-1 text-right text-orange-900 outline-none placeholder:text-xs focus:border-hp-blue"
+                      />
+                    ) : editing ? (
                       <input
                         inputMode="decimal"
                         value={draftPrice}

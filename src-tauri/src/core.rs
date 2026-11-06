@@ -189,6 +189,13 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
 
         "get_day_end" => out(core.with_db(|c| store::day_end_page(c))?),
         "save_day_end" => write(core.with_db(|c| store::save_day_end(c, arg(args)?))),
+        "get_office_settings" => out(core.with_db(|c| store::office_settings(c))?),
+        "set_system_price" => {
+            let a: Value = arg(args)?;
+            write(out(core.with_db(|c| store::set_system_price(c, &a["systemPrice"]))?))
+        }
+        "save_delivery_sales" => write(out(core.with_db(|c| store::save_delivery_sales(c, arg(args)?))?)),
+        "sales_suggestions" => out(core.with_db(|c| store::sales_suggestions(c))?),
         "finalize_day" => write(out(core.with_db(|c| store::finalize_day(c, arg(args)?))?)),
 
         "get_history_day" => {
