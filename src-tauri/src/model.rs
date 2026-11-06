@@ -113,6 +113,11 @@ pub struct RegisterDTO {
 pub struct SoldProduct {
     pub name: String,
     pub quantity: i64,
+    /// Money received for this product, by cash and online (v1.8.1+; earlier sheets had one total).
+    #[serde(default)]
+    pub cash: f64,
+    #[serde(default)]
+    pub online: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -167,6 +172,7 @@ pub struct DeliverySalesDTO {
     pub products: Vec<SoldProduct>,
     pub cash: f64,
     pub online: f64,
+    // `cash` and `online` are the totals of the product lines.
     /// Total of `system_payments`.
     pub system: f64,
     pub system_payments: Vec<SystemPayment>,

@@ -10,7 +10,7 @@ import { Card } from "./DayEndViews";
 
 // ---------------------------------------------------------------------------------------------
 // Delivery boy sales: per delivery boy, what he sold (usually one product, sometimes more or none),
-// the money he reported (cash and online as totals; system payments one by one, with the consumer
+// the money he reported (cash and online on each product line; system payments one by one, with the consumer
 // number and an optional name, at the fixed System price from Settings), and what he spent
 // from it (fuel, service…). Product and expense names autocomplete from what was used before;
 // new names are remembered once saved. Each card saves itself shortly after typing stops.
@@ -24,9 +24,8 @@ const NO_SUGGESTIONS: SalesSuggestions = { products: [], expenses: [], consumers
 
 /** What a card sends to the backend (and what the summary adds up). */
 export type SalesBody = {
-  products: { name: string; quantity: string }[];
-  cash: string;
-  online: string;
+  /** Each product line carries the cash and online money received for it. */
+  products: { name: string; quantity: string; cash: string; online: string }[];
   systemPayments: { consumerNo: string; name: string; amount: string }[];
   expenses: { name: string; amount: string }[];
 };
@@ -54,9 +53,7 @@ const paise = (n: number) => Math.round(n * 100) / 100;
 function toBody(s: DeliverySalesDTO): SalesBody {
   const text = (n: number) => (n ? String(n) : "");
   return {
-    products: s.products.map((p) => ({ name: p.name, quantity: text(p.quantity) })),
-    cash: text(s.cash),
-    online: text(s.online),
+    products: s.products.map((p) => ({ name: p.name, quantity: text(p.quantity), cash: text(p.cash), online: text(p.online) })),
     systemPayments: s.systemPayments.map((p) => ({ consumerNo: p.consumerNo, name: p.name ?? "", amount: text(p.amount) })),
     expenses: s.expenses.map((e) => ({ name: e.name, amount: text(e.amount) })),
   };
@@ -65,8 +62,7 @@ function toBody(s: DeliverySalesDTO): SalesBody {
 /** For comparing what's typed with what's saved: same numbers and text, however they're written. */
 const canon = (b: SalesBody) =>
   JSON.stringify([
-    b.products.map((p) => [p.name.trim().replace(/\s+/g, " "), num(p.quantity)]),
-    [num(b.cash), num(b.online)],
+    b.products.map((p) => [p.name.trim().replace(/\s+/g, " "), num(p.quantity), num(p.cash), num(p.online)]),
     b.systemPayments.map((p) => [p.consumerNo, p.name.trim().replace(/\s+/g, " "), num(p.amount)]),
     b.expenses.map((e) => [e.name.trim().replace(/\s+/g, " "), num(e.amount)]),
   ]);
@@ -82,19 +78,20 @@ export function summarize(bodies: SalesBody[]): SalesSummary {
   for (const b of bodies) {
     let any = false;
     for (const p of b.products) {
+      cash += num(p.cash);
+      online += num(p.online);
+      if (num(p.cash) || num(p.online)) any = true;
       const q = num(p.quantity);
       if (!q || !p.name.trim()) continue;
       sold.set(p.name.trim(), (sold.get(p.name.trim()) ?? 0) + q);
       any = true;
     }
     const spent = b.expenses.reduce((s, e) => s + num(e.amount), 0);
-    cash += num(b.cash);
-    online += num(b.online);
     const sys = b.systemPayments.reduce((s, p) => s + num(p.amount), 0);
     system += sys;
     systemCount += b.systemPayments.filter((p) => num(p.amount)).length;
     expenses += spent;
-    if (any || num(b.cash) || num(b.online) || sys || spent) boys++;
+    if (any || sys || spent) boys++;
   }
   return {
     sold: [...sold.entries()].sort((a, b) => b[1] - a[1]),
@@ -144,9 +141,13 @@ export function DeliverySalesSection({ sales, flushers, onSummary }: Props) {
         <div className="text-sm">
           <div className={`${SHEET_COLS} border-b border-slate-200 bg-slate-50 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500`}>
             <span>Delivery boy</span>
-            <span>Sold · qty</span>
-            <span className="text-right">Cash</span>
-            <span className="text-right text-violet-700">Online</span>
+            <span className={LINE}>
+              <span className="min-w-0 flex-1">Product</span>
+              <span className={`${QTY} text-right`}>Qty</span>
+              <span className={`${MONEY} text-right`}>Cash</span>
+              <span className={`${MONEY} text-right text-violet-700`}>Online</span>
+              <span className={X_SLOT} />
+            </span>
             <span className="text-orange-700" title="One line per system payment: consumer number and name (optional). The price is fixed in Settings.">
               System · consumer · name{" "}
               {systemPrice ? (
@@ -173,17 +174,25 @@ export function DeliverySalesSection({ sales, flushers, onSummary }: Props) {
 }
 
 /** One line per delivery boy, columns shared with the header and totals. */
-const SHEET_COLS = "grid grid-cols-[7.5rem_minmax(10rem,1.3fr)_5.5rem_5.5rem_minmax(17rem,1.7fr)_minmax(10rem,1.1fr)_8rem] items-start gap-x-2 px-4";
+const SHEET_COLS = "grid grid-cols-[7.5rem_minmax(25rem,2.6fr)_minmax(16rem,1.6fr)_minmax(10rem,1fr)_8rem] items-start gap-x-2 px-4";
+// A product line: product · qty · cash · online · ×. The header and totals use the same widths.
+const LINE = "flex items-center gap-1";
+const QTY = "w-14 shrink-0";
+const MONEY = "w-[5.5rem] shrink-0";
+const X_SLOT = "w-6 shrink-0"; // the × button
 
 function TotalsRow({ summary: s }: { summary: SalesSummary }) {
   return (
     <div className={`${SHEET_COLS} rounded-b-xl border-t-2 border-slate-200 bg-slate-50 py-2.5 font-semibold`}>
       <span className="text-slate-800">Total</span>
-      <span className="font-normal text-slate-600">
-        {s.sold.length ? s.sold.map(([name, q]) => `${name} × ${q}`).join(" · ") : <span className="text-slate-400">nothing sold yet</span>}
+      <span className={`${LINE} items-start`}>
+        <span className="min-w-0 flex-1 font-normal text-slate-600">
+          {s.sold.length ? s.sold.map(([name, q]) => `${name} × ${q}`).join(" · ") : <span className="text-slate-400">nothing sold yet</span>}
+        </span>
+        <span className={`tabular ${MONEY} text-right`}>{formatINR(s.cash)}</span>
+        <span className={`tabular ${MONEY} text-right text-violet-800`}>{formatINR(s.online)}</span>
+        <span className={X_SLOT} />
       </span>
-      <span className="tabular text-right">{formatINR(s.cash)}</span>
-      <span className="tabular text-right text-violet-800">{formatINR(s.online)}</span>
       <span className="tabular pr-7 text-right text-orange-800">
         {s.systemCount ? <span className="mr-1.5 text-xs font-normal text-slate-500">{s.systemCount} ×</span> : null}
         {formatINR(s.system)}
@@ -200,8 +209,10 @@ type SaveState = "idle" | "waiting" | "saving" | "saved" | "failed";
 /** Rows typed on screen keep a stable key; a blank product row is always there to type into. */
 type Draft = SalesBody & { keys: { products: number[]; expenses: number[]; system: number[] } };
 let nextKey = 1;
+const BLANK_LINE = { name: "", quantity: "", cash: "", online: "" };
+const hasValues = (p: SalesBody["products"][number]) => !!(p.quantity || p.cash || p.online);
 const withKeys = (b: SalesBody): Draft => {
-  const products = b.products.length ? b.products : [{ name: "", quantity: "" }];
+  const products = b.products.length ? b.products : [BLANK_LINE];
   return {
     ...b,
     products,
@@ -233,14 +244,12 @@ function SalesRow({
   const [state, setState] = useState<SaveState>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  // A blank first product row with a quantity is the usual product (shown in grey).
+  // A blank first product row with a quantity or money is the usual product (shown in grey).
   const body = useCallback(
     (d: Draft): SalesBody => ({
       products: d.products
-        .map((p, i) => ({ name: p.name.trim() || (i === 0 && p.quantity && usual ? usual : p.name), quantity: p.quantity }))
-        .filter((p) => p.name.trim() || p.quantity),
-      cash: d.cash,
-      online: d.online,
+        .map((p, i) => ({ ...p, name: p.name.trim() || (i === 0 && hasValues(p) && usual ? usual : p.name) }))
+        .filter((p) => p.name.trim() || hasValues(p)),
       systemPayments: d.systemPayments.filter((p) => p.consumerNo || p.name.trim()),
       // A row just added and still blank isn't saved (nor is it taken away while typing).
       expenses: d.expenses.filter((e) => e.name.trim() || e.amount),
@@ -362,7 +371,7 @@ function SalesRow({
   const addProduct = () => {
     change((d) => ({
       ...d,
-      products: [...d.products, { name: "", quantity: "" }],
+      products: [...d.products, BLANK_LINE],
       keys: { ...d.keys, products: [...d.keys.products, nextKey++] },
     }));
     focusLast('input[data-auto="product"]');
@@ -374,7 +383,7 @@ function SalesRow({
       // Always leave one row to type into.
       return products.length
         ? { ...d, products, keys: { ...d.keys, products: keys } }
-        : { ...d, products: [{ name: "", quantity: "" }], keys: { ...d.keys, products: [nextKey++] } };
+        : { ...d, products: [BLANK_LINE], keys: { ...d.keys, products: [nextKey++] } };
     });
   const addExpense = () => {
     change((d) => ({
@@ -419,7 +428,7 @@ function SalesRow({
       <div>
         <div className="space-y-1">
           {draft.products.map((p, i) => (
-            <div key={draft.keys.products[i]} className="flex items-center gap-1">
+            <div key={draft.keys.products[i]} className={LINE}>
               <AutoInput
                 dataKey="product"
                 ariaLabel={`Product sold by ${initial.deliveryBoyName}`}
@@ -437,12 +446,29 @@ function SalesRow({
                 maxLength={4}
                 onFocus={(e) => e.target.select()}
                 onChange={(e) => setProduct(i, { quantity: e.target.value.replace(/\D/g, "").slice(0, 4) })}
-                className={`${box} w-14 shrink-0 text-right`}
+                className={`${box} ${QTY} text-right`}
               />
+              {(
+                [
+                  ["cash", "Cash"],
+                  ["online", "Online"],
+                ] as const
+              ).map(([k, label]) => (
+                <input
+                  key={k}
+                  inputMode="decimal"
+                  aria-label={`${label} from ${initial.deliveryBoyName}`}
+                  value={p[k]}
+                  placeholder="0"
+                  onFocus={(e) => e.target.select()}
+                  onChange={(e) => setProduct(i, { [k]: money(e.target.value) })}
+                  className={`${box} ${MONEY} text-right`}
+                />
+              ))}
               <RemoveButton
                 label="Remove product"
                 onClick={() => removeProduct(i)}
-                hidden={draft.products.length === 1 && !p.name && !p.quantity}
+                hidden={draft.products.length === 1 && !p.name && !hasValues(p)}
               />
             </div>
           ))}
@@ -450,23 +476,6 @@ function SalesRow({
         {draft.products.length < LINES_MAX && <AddButton text="Product" onClick={addProduct} />}
       </div>
 
-      {(
-        [
-          ["cash", "Cash"],
-          ["online", "Online"],
-        ] as const
-      ).map(([k, label]) => (
-        <input
-          key={k}
-          inputMode="decimal"
-          aria-label={`${label} from ${initial.deliveryBoyName}`}
-          value={draft[k]}
-          placeholder="0"
-          onFocus={(e) => e.target.select()}
-          onChange={(e) => change((d) => ({ ...d, [k]: money(e.target.value) }))}
-          className={`${box} w-full text-right`}
-        />
-      ))}
 
       <div>
         {draft.systemPayments.length > 0 && (
@@ -626,10 +635,23 @@ export function DeliverySalesView({ sales }: { sales: DeliverySalesDTO[] }) {
               <tr key={s.deliveryBoyId}>
                 <td className="px-4 py-2 font-medium text-slate-800">{s.deliveryBoyName}</td>
                 <td className="px-2 py-2 text-slate-700">
-                  {s.products
-                    .filter((p) => p.quantity > 0)
-                    .map((p) => `${p.name} × ${p.quantity}`)
-                    .join(", ") || <span className="text-slate-300">—</span>}
+                  {s.products.some((p) => p.quantity || p.cash || p.online) ? (
+                    s.products
+                      .filter((p) => p.quantity || p.cash || p.online)
+                      .map((p, i) => (
+                        <span key={i} className="block">
+                          {p.name} × {p.quantity}
+                          {/* Money per product, when he sold more than one. */}
+                          {s.products.length > 1 && (p.cash || p.online) ? (
+                            <span className="tabular ml-1.5 text-[11px] text-slate-500">
+                              {[p.cash ? `cash ${formatINR(p.cash)}` : "", p.online ? `online ${formatINR(p.online)}` : ""].filter(Boolean).join(" · ")}
+                            </span>
+                          ) : null}
+                        </span>
+                      ))
+                  ) : (
+                    <span className="text-slate-300">—</span>
+                  )}
                 </td>
                 <td className="tabular px-2 py-2 text-right">{formatINR(s.cash)}</td>
                 <td className="tabular px-2 py-2 text-right">{formatINR(s.online)}</td>

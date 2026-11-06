@@ -619,7 +619,10 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "dateString": r.get::<_, String>(1)?,
                     "deliveryBoyId": r.get::<_, String>(2)?,
                     "deliveryBoyName": r.get::<_, String>(3)?,
-                    "products": products.iter().map(|p| doc! { "name": &p.name, "quantity": p.quantity }).collect::<Vec<_>>(),
+                    "products": products
+                        .iter()
+                        .map(|p| doc! { "name": &p.name, "quantity": p.quantity, "cash": p.cash, "online": p.online })
+                        .collect::<Vec<_>>(),
                     "cash": cash,
                     "online": online,
                     "system": system,
@@ -881,10 +884,13 @@ async fn find_all(db: &Database, coll: &str, filter: Document) -> mongodb::error
 
 fn sales_from_doc(d: &Document) -> DeliverySalesDTO {
     let lines = |k: &str| d.get_array(k).map(|a| a.iter().filter_map(|e| e.as_document()).collect::<Vec<_>>()).unwrap_or_default();
-    DeliverySalesDTO {
+    store::money_on_lines(DeliverySalesDTO {
         delivery_boy_id: s(d, "deliveryBoyId"),
         delivery_boy_name: s(d, "deliveryBoyName"),
-        products: lines("products").into_iter().map(|p| SoldProduct { name: s(p, "name"), quantity: num(p, "quantity") as i64 }).collect(),
+        products: lines("products")
+            .into_iter()
+            .map(|p| SoldProduct { name: s(p, "name"), quantity: num(p, "quantity") as i64, cash: num(p, "cash"), online: num(p, "online") })
+            .collect(),
         cash: num(d, "cash"),
         online: num(d, "online"),
         system: num(d, "system"),
@@ -899,7 +905,7 @@ fn sales_from_doc(d: &Document) -> DeliverySalesDTO {
         usual_product: None,
         updated_by_user: opt_s(d, "updatedByUser"),
         updated_at: iso(d, "updatedAt"),
-    }
+    })
 }
 
 fn day_copy_from_doc(d: &Document) -> DayCopy {
