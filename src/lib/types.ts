@@ -71,8 +71,7 @@ export type RegisterDTO = {
   transactions: TransactionDTO[];
 };
 
-/** A product line: what he sold and the money received for it. */
-export type SoldProduct = { name: string; quantity: number; cash: number; online: number };
+export type SoldProduct = { name: string; quantity: number };
 
 /** name: what it was for, as typed ("Fuel", "Service", "Tyre puncture"…). */
 export type Expense = { name: string; amount: number };

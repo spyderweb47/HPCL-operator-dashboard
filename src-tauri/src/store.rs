@@ -1075,22 +1075,8 @@ fn parse_sold(v: &Value) -> R<i64> {
 const SALES_COLS: &str =
     "delivery_boy_id, delivery_boy_name, products, cash, online, system, expenses, updated_by_user, updated_at, system_payments";
 
-/// Sheets saved by v1.8.0 had one cash and one online total for all products: show them on the
-/// first product line (a blank one if none), so they can be edited like the rest.
-pub fn money_on_lines(mut s: DeliverySalesDTO) -> DeliverySalesDTO {
-    let lines_have_money = s.products.iter().any(|p| p.cash != 0.0 || p.online != 0.0);
-    if !lines_have_money && (s.cash != 0.0 || s.online != 0.0) {
-        if s.products.is_empty() {
-            s.products.push(SoldProduct { name: String::new(), quantity: 0, cash: 0.0, online: 0.0 });
-        }
-        s.products[0].cash = s.cash;
-        s.products[0].online = s.online;
-    }
-    s
-}
-
 fn sales_from_row(r: &Row) -> rusqlite::Result<DeliverySalesDTO> {
-    Ok(money_on_lines(DeliverySalesDTO {
+    Ok(DeliverySalesDTO {
         delivery_boy_id: r.get(0)?,
         delivery_boy_name: r.get(1)?,
         products: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
@@ -1102,7 +1088,7 @@ fn sales_from_row(r: &Row) -> rusqlite::Result<DeliverySalesDTO> {
         usual_product: None,
         updated_by_user: r.get(7)?,
         updated_at: Some(r.get(8)?),
-    }))
+    })
 }
 
 /// What was saved for a day, by delivery boy name.
@@ -1171,10 +1157,6 @@ pub struct SoldInput {
     pub name: String,
     #[serde(default)]
     pub quantity: Value,
-    #[serde(default)]
-    pub cash: Value,
-    #[serde(default)]
-    pub online: Value,
 }
 
 #[derive(Deserialize)]
@@ -1199,9 +1181,12 @@ pub struct SystemPaymentInput {
 #[serde(rename_all = "camelCase")]
 pub struct SalesInput {
     pub delivery_boy_id: String,
-    /// Each product line carries its own cash and online amounts; the sheet's totals are their sums.
     #[serde(default)]
     pub products: Vec<SoldInput>,
+    #[serde(default)]
+    pub cash: Value,
+    #[serde(default)]
+    pub online: Value,
     /// One line per system payment; the System total is their sum.
     #[serde(default)]
     pub system_payments: Vec<SystemPaymentInput>,
@@ -1221,14 +1206,13 @@ pub fn save_delivery_sales(conn: &mut Connection, input: SalesInput) -> R<Delive
     let mut products = Vec::new();
     for p in &input.products {
         let (name, quantity) = (clean_name(&p.name), parse_sold(&p.quantity)?);
-        let (cash, online) = (parse_money(&p.cash)?, parse_money(&p.online)?);
-        if name.is_empty() && quantity == 0 && cash == 0.0 && online == 0.0 {
+        if name.is_empty() && quantity == 0 {
             continue;
         }
         if name.is_empty() {
-            return Err("Enter the product name on each line with a quantity or money.".into());
+            return Err("Enter the product name for each quantity sold.".into());
         }
-        products.push(SoldProduct { name, quantity, cash, online });
+        products.push(SoldProduct { name, quantity });
     }
     let mut expenses = Vec::new();
     for e in &input.expenses {
@@ -1254,9 +1238,7 @@ pub fn save_delivery_sales(conn: &mut Connection, input: SalesInput) -> R<Delive
             None => return Err("Enter the 6-digit consumer number for each system payment.".into()),
         }
     }
-    let paise = |v: f64| (v * 100.0).round() / 100.0;
-    let cash = paise(products.iter().map(|p| p.cash).sum());
-    let online = paise(products.iter().map(|p| p.online).sum());
+    let (cash, online) = (parse_money(&input.cash)?, parse_money(&input.online)?);
     let price_now = system_price(conn)?;
 
     let date = time::today();
@@ -1841,8 +1823,8 @@ mod tests {
         let saved = save(
             &mut c,
             json!({"deliveryBoyId":suresh.id,
-                   "products":[{"name":" Refill  14.2kg ","quantity":"12","cash":"9000.5","online":"2400"},{"name":"","quantity":""},
-                               {"name":"Refill 19kg","quantity":"","cash":"1500"}],
+                   "products":[{"name":" Refill  14.2kg ","quantity":"12"},{"name":"","quantity":""},{"name":"Refill 19kg","quantity":""}],
+                   "cash":"10500.5","online":"2400",
                    "systemPayments":[{"consumerNo":"123-456","name":"  Anil  Kumar ","amount":"900"},{"consumerNo":"654321","amount":"450.5"},
                                      {"consumerNo":"","name":"","amount":""}],
                    "expenses":[{"name":"  Fuel ","amount":"200"},{"name":"Tyre puncture","amount":""},{"name":"","amount":""}]}),
@@ -1851,10 +1833,7 @@ mod tests {
         // Blank lines dropped; a product still waiting for its quantity is kept.
         assert_eq!(
             saved.products,
-            vec![
-                SoldProduct { name: "Refill 14.2kg".into(), quantity: 12, cash: 9000.5, online: 2400.0 },
-                SoldProduct { name: "Refill 19kg".into(), quantity: 0, cash: 1500.0, online: 0.0 }
-            ]
+            vec![SoldProduct { name: "Refill 14.2kg".into(), quantity: 12 }, SoldProduct { name: "Refill 19kg".into(), quantity: 0 }]
         );
         // System lines take the fixed price (an amount sent along is ignored).
         assert_eq!((saved.cash, saved.online, saved.system), (10500.5, 2400.0, 1800.0));
@@ -1875,9 +1854,8 @@ mod tests {
         // Saving the same sheet again changes nothing (nothing to upload).
         save(
             &mut c,
-            json!({"deliveryBoyId":suresh.id,
-                   "products":[{"name":"Refill 14.2kg","quantity":12,"cash":9000.5,"online":2400},{"name":"Refill 19kg","quantity":0,"cash":1500}],
-                   "expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
+            json!({"deliveryBoyId":suresh.id,"products":[{"name":"Refill 14.2kg","quantity":12},{"name":"Refill 19kg","quantity":0}],
+                   "cash":10500.5,"online":2400,"expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
                    "systemPayments":[{"consumerNo":"123456","name":"Anil Kumar","amount":900},{"consumerNo":"654321","amount":450.5}]}),
         )
         .unwrap();
@@ -1888,9 +1866,8 @@ mod tests {
         set_system_price(&c, &json!(1000)).unwrap();
         let more = save(
             &mut c,
-            json!({"deliveryBoyId":suresh.id,
-                   "products":[{"name":"Refill 14.2kg","quantity":12,"cash":9000.5,"online":2400},{"name":"Refill 19kg","quantity":0,"cash":1500}],
-                   "expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
+            json!({"deliveryBoyId":suresh.id,"products":[{"name":"Refill 14.2kg","quantity":12},{"name":"Refill 19kg","quantity":0}],
+                   "cash":10500.5,"online":2400,"expenses":[{"name":"Fuel","amount":200},{"name":"Tyre puncture","amount":0}],
                    "systemPayments":[{"consumerNo":"123456","name":"Anil Kumar"},{"consumerNo":"654321"},{"consumerNo":"111111"}]}),
         )
         .unwrap();
@@ -1899,8 +1876,7 @@ mod tests {
 
         // Bad input is refused with a message.
         assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"","quantity":3}]})).is_err());
-        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"X","cash":"-5"}]})).is_err());
-        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"","online":"50"}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"cash":"-5"})).is_err());
         assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"products":[{"name":"X","quantity":"1.5"}]})).is_err());
         assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"expenses":[{"name":" ","amount":5}]})).is_err());
         assert!(save(&mut c, json!({"deliveryBoyId":suresh.id,"systemPayments":[{"consumerNo":"","name":"Anil"}]})).is_err());
@@ -1912,7 +1888,7 @@ mod tests {
         assert_eq!(s.products, ["Refill 14.2kg", "Refill 19kg", "Regulator"]);
         assert_eq!(s.expenses, ["Fuel", "Tyre puncture", "Service"]);
         assert_eq!(s.consumers.iter().map(|c| (c.consumer_no.as_str(), c.name.as_str())).collect::<Vec<_>>(), [("123456", "Anil Kumar")]);
-        assert!(save(&mut c, json!({"deliveryBoyId":"nobody","products":[{"name":"X","cash":5}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":"nobody","cash":5})).is_err());
 
         // Tomorrow, his card offers the product he sold last.
         c.execute("UPDATE delivery_sales SET date_string = '2000-01-01', id = '2000-01-01:' || delivery_boy_id", []).unwrap();
@@ -1924,7 +1900,7 @@ mod tests {
         let remote = |name: &str, cash: f64| DeliverySalesDTO {
             delivery_boy_id: ramesh.id.clone(),
             delivery_boy_name: name.into(),
-            products: vec![SoldProduct { name: "Refill 14.2kg".into(), quantity: 4, cash, online: 0.0 }],
+            products: vec![SoldProduct { name: "Refill 14.2kg".into(), quantity: 4 }],
             cash,
             online: 0.0,
             system: 0.0,
@@ -1945,20 +1921,9 @@ mod tests {
         let unsynced: i64 = c.query_row("SELECT COUNT(*) FROM delivery_sales WHERE version > synced_version AND date_string = ?1", [&today], |r| r.get(0)).unwrap();
         assert_eq!(unsynced, 0);
 
-        // A sheet saved by v1.8.0 (one cash/online total): the money shows on the first product line.
-        c.execute(
-            "INSERT INTO delivery_sales (id, date_string, delivery_boy_id, delivery_boy_name, products, cash, online, created_at, updated_at)
-             VALUES ('old', '2001-01-01', 'x', 'Old', '[{\"name\":\"Refill\",\"quantity\":5},{\"name\":\"Stove\",\"quantity\":1}]', 4500, 300, ?1, ?1)",
-            [time::now_iso()],
-        )
-        .unwrap();
-        let old = sales_for_date(&c, "2001-01-01").unwrap().remove(0);
-        assert_eq!((old.products[0].cash, old.products[0].online, old.products[1].cash), (4500.0, 300.0, 0.0));
-        assert_eq!((old.cash, old.online), (4500.0, 300.0));
-
         // Once the day is finalized, sheets are locked.
         finalize_day(&mut c, serde_json::from_value(json!({})).unwrap()).unwrap();
-        assert!(save(&mut c, json!({"deliveryBoyId":ramesh.id,"products":[{"name":"X","cash":1}]})).is_err());
+        assert!(save(&mut c, json!({"deliveryBoyId":ramesh.id,"cash":1})).is_err());
         assert_eq!(day_end_page(&c).unwrap().sales.len(), 1); // finalized: only what was saved
     }
 
