@@ -1,10 +1,10 @@
 import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Bike, Check, Copy, Loader2, Monitor, MonitorCheck, Pencil, Plus, RotateCcw, UserRound, UserX, X } from "lucide-react";
+import { Bike, Check, Copy, Loader2, Monitor, MonitorCheck, Package, Pencil, Plus, RotateCcw, Search, Trash2, UserRound, UserX, X } from "lucide-react";
 import { mutate } from "@/lib/api";
 import { formatDateTime } from "@/lib/date";
 import { useQuery } from "@/lib/useQuery";
 import { formatINR } from "@/lib/format";
-import type { AppInfoDTO, DeliveryBoyDTO, OfficeSettingsDTO, SyncStatusDTO } from "@/lib/types";
+import type { AppInfoDTO, DeliveryBoyDTO, OfficeSettingsDTO, SavedProductDTO, SyncStatusDTO } from "@/lib/types";
 import { CloudSettings } from "@/components/CloudSettings";
 import { Card } from "@/components/DayEndViews";
 import { LoadError } from "@/components/LoadError";
@@ -19,6 +19,7 @@ export function SettingsPage() {
       <OperatorName />
       <SystemPrice />
       <DeliveryBoysSettings />
+      <SavedProducts />
       <CloudSettings />
       <DeviceInfo />
     </div>
@@ -356,6 +357,135 @@ function DeliveryBoysSettings() {
       )}
       <p className="border-t border-slate-100 px-4 py-2 text-xs text-slate-400">
         Deactivate instead of deleting: past day-end records keep their names, and they can be reactivated any time.
+      </p>
+    </Card>
+  );
+}
+
+/** The names the product boxes suggest. A misspelt one can be removed here, on every PC. */
+function SavedProducts() {
+  const { data: products, error: loadError } = useQuery<SavedProductDTO[]>("saved_products");
+  const [filter, setFilter] = useState("");
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [flash, setFlash] = useState<string | null>(null);
+
+  const remove = async (name: string) => {
+    setBusy(name);
+    const res = await mutate("remove_saved_product", { name });
+    setBusy(null);
+    setConfirming(null);
+    if (!res.ok) {
+      setError(res.error);
+      setFlash(null);
+      return;
+    }
+    setError(null);
+    setFlash(`Removed ${name}.`);
+  };
+
+  const q = filter.trim().toLowerCase();
+  const shown = products?.filter((p) => p.name.toLowerCase().includes(q)) ?? [];
+
+  return (
+    <Card
+      title="Saved Products"
+      icon={Package}
+      aside={products && <span className="text-sm text-slate-500">{products.length} saved</span>}
+    >
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && setFilter("")}
+            placeholder="Find a product"
+            aria-label="Find a saved product"
+            className="w-72 rounded-lg border border-slate-300 py-2 pl-8 pr-3 outline-none focus:border-hp-blue focus:ring-2 focus:ring-hp-blue/20"
+          />
+        </div>
+        <span className="text-sm">
+          {error ? (
+            <span role="alert" className="font-medium text-red-600">
+              {error}
+            </span>
+          ) : flash ? (
+            <span className="font-medium text-emerald-700">{flash}</span>
+          ) : (
+            <span className="text-slate-400">Suggested in the Day Register and on the delivery boy sheet.</span>
+          )}
+        </span>
+      </div>
+
+      {loadError ? (
+        <div className="p-4">
+          <LoadError message={loadError} />
+        </div>
+      ) : (
+        <div className="max-h-80 overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-4 py-2">Name</th>
+                <th className="w-40 px-2 py-2 text-right">Last price</th>
+                <th className="w-56 px-4 py-2 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {products && shown.length === 0 && (
+                <tr>
+                  <td colSpan={3} className="px-4 py-8 text-center text-slate-400">
+                    {products.length === 0 ? "No products yet. They're saved as you make entries." : "No product matches."}
+                  </td>
+                </tr>
+              )}
+              {shown.map((p) => (
+                <tr key={p.name} className={confirming === p.name ? "bg-red-50" : ""}>
+                  <td className="px-4 py-2 font-medium text-slate-800">{p.name}</td>
+                  <td className="tabular px-2 py-2 text-right text-slate-500">
+                    {p.lastUsedPrice != null ? formatINR(p.lastUsedPrice) : <span className="text-slate-400">Delivery sheet only</span>}
+                  </td>
+                  <td className="px-4 py-2">
+                    <div className="flex items-center justify-end gap-1">
+                      {busy === p.name ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-slate-400" />
+                      ) : confirming === p.name ? (
+                        <>
+                          <span className="mr-1 text-xs font-medium text-red-700">Remove?</span>
+                          <SmallButton label="Yes, remove" text="Yes" onClick={() => remove(p.name)} className="text-red-700 hover:bg-red-100">
+                            <Check className="h-4 w-4" />
+                          </SmallButton>
+                          <SmallButton label="Keep it" text="No" onClick={() => setConfirming(null)} className="text-slate-600 hover:bg-slate-100">
+                            <X className="h-4 w-4" />
+                          </SmallButton>
+                        </>
+                      ) : (
+                        <SmallButton
+                          label={`Remove ${p.name}`}
+                          text="Remove"
+                          onClick={() => {
+                            setConfirming(p.name);
+                            setFlash(null);
+                            setError(null);
+                          }}
+                          className="text-red-600 hover:bg-red-50"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </SmallButton>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="border-t border-slate-100 px-4 py-2 text-xs text-slate-400">
+        Removing only stops the suggestion, on all the office&apos;s PCs. Past entries keep the name. Typing the name again
+        saves it again (in the register, with its price).
       </p>
     </Card>
   );

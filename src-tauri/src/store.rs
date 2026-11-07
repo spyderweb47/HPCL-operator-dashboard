@@ -4,7 +4,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::model::*;
@@ -276,8 +276,9 @@ fn touch_product(tx: &Transaction, name: &str, price: f64, now: &str) -> R<Strin
         "INSERT INTO products (id, name, last_used_price, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
          ON CONFLICT(name) DO UPDATE SET last_used_price = excluded.last_used_price,
                                          updated_at = excluded.updated_at,
+                                         deleted = 0,
                                          version = version + 1
-         WHERE last_used_price <> excluded.last_used_price",
+         WHERE last_used_price <> excluded.last_used_price OR deleted = 1",
         params![new_id(), name, price, now],
     )
     .map_err(db_err)?;
@@ -289,7 +290,8 @@ fn touch_product(tx: &Transaction, name: &str, price: f64, now: &str) -> R<Strin
 fn add_product(tx: &Transaction, name: &str, price: f64, now: &str) -> R<String> {
     tx.execute(
         "INSERT INTO products (id, name, last_used_price, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
-         ON CONFLICT(name) DO NOTHING",
+         ON CONFLICT(name) DO UPDATE SET deleted = 0, updated_at = excluded.updated_at, version = version + 1
+         WHERE deleted = 1",
         params![new_id(), name, price, now],
     )
     .map_err(db_err)?;
@@ -346,7 +348,11 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         price = Some(system_price(&tx)?.ok_or(SYSTEM_PRICE_MISSING)?);
     } else if price.is_none() {
         let last: Option<f64> = tx
-            .query_row("SELECT last_used_price FROM products WHERE name = ?1", [&name], |r| r.get(0))
+            .query_row(
+                "SELECT last_used_price FROM products WHERE name = ?1 AND deleted = 0 AND last_used_price > 0",
+                [&name],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?;
         price = Some(last.ok_or_else(|| format!("\"{name}\" is a new item — enter its price."))?);
@@ -542,7 +548,7 @@ pub fn search_products(conn: &Connection, q: &str) -> R<Vec<ProductSuggestion>> 
     let mut stmt = conn
         .prepare_cached(
             "SELECT name, last_used_price FROM products
-             WHERE name LIKE ?1 ESCAPE '\\'
+             WHERE name LIKE ?1 ESCAPE '\\' AND deleted = 0 AND last_used_price > 0
              ORDER BY (name LIKE ?2 ESCAPE '\\') DESC, name COLLATE NOCASE
              LIMIT 8",
         )
@@ -1281,6 +1287,17 @@ pub fn save_delivery_sales(conn: &mut Connection, input: SalesInput) -> R<Delive
     }
     let user = user_name(&tx)?;
     let now = time::now_iso();
+    // A product name removed in Settings and typed again here is in use again.
+    for p in &products {
+        let key = p.name.to_lowercase();
+        if !existing.as_ref().is_some_and(|e| e.products.iter().any(|o| o.name.to_lowercase() == key)) {
+            tx.execute(
+                "UPDATE products SET deleted = 0, updated_at = ?2, version = version + 1 WHERE name = ?1 AND deleted = 1",
+                params![p.name, now],
+            )
+            .map_err(db_err)?;
+        }
+    }
     let (products_json, expenses_json) = (
         serde_json::to_string(&products).unwrap_or_default(),
         serde_json::to_string(&expenses).unwrap_or_default(),
@@ -1327,6 +1344,7 @@ pub fn sales_suggestions(conn: &Connection) -> R<SalesSuggestions> {
         }
     };
     let (mut products, mut expenses) = (Tally::new(), Tally::new());
+    let removed = removed_products(conn)?;
     // consumer number -> name, newest first
     let mut consumers: Vec<KnownConsumer> = Vec::new();
     let mut stmt = conn
@@ -1343,13 +1361,15 @@ pub fn sales_suggestions(conn: &Connection) -> R<SalesSuggestions> {
             }
         }
         for p in serde_json::from_str::<Vec<SoldProduct>>(&p).unwrap_or_default() {
-            add(&mut products, &p.name, 1);
+            if !removed.contains(&p.name.to_lowercase()) {
+                add(&mut products, &p.name, 1);
+            }
         }
         for e in serde_json::from_str::<Vec<Expense>>(&e).unwrap_or_default() {
             add(&mut expenses, &e.name, 1);
         }
     }
-    let mut stmt = conn.prepare_cached("SELECT name FROM products").map_err(db_err)?;
+    let mut stmt = conn.prepare_cached("SELECT name FROM products WHERE deleted = 0").map_err(db_err)?;
     for name in stmt.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)? {
         add(&mut products, &name.map_err(db_err)?, 0);
     }
@@ -1362,6 +1382,63 @@ pub fn sales_suggestions(conn: &Connection) -> R<SalesSuggestions> {
         v.into_iter().map(|(name, _)| name).collect()
     };
     Ok(SalesSuggestions { products: ranked(products), expenses: ranked(expenses), consumers })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Saved product names (Settings): remove a misspelt or unused one from the suggestions
+// ---------------------------------------------------------------------------------------------
+
+fn removed_products(conn: &Connection) -> R<HashSet<String>> {
+    let mut stmt = conn.prepare_cached("SELECT name FROM products WHERE deleted = 1").map_err(db_err)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)?;
+    rows.map(|n| n.map(|n| n.to_lowercase()).map_err(db_err)).collect()
+}
+
+/// Every name the product boxes suggest: the register's catalog and the names typed on the
+/// delivery boy sheet, A–Z, with the register's last price where there is one.
+pub fn saved_products(conn: &Connection) -> R<Vec<SavedProductDTO>> {
+    let mut prices: HashMap<String, f64> = HashMap::new();
+    let mut stmt = conn
+        .prepare_cached("SELECT name, last_used_price FROM products WHERE deleted = 0 AND last_used_price > 0")
+        .map_err(db_err)?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))).map_err(db_err)? {
+        let (name, price) = row.map_err(db_err)?;
+        prices.insert(name.to_lowercase(), price);
+    }
+    let mut out: Vec<SavedProductDTO> = sales_suggestions(conn)?
+        .products
+        .into_iter()
+        .map(|name| SavedProductDTO { last_used_price: prices.get(&name.to_lowercase()).copied(), name })
+        .collect();
+    out.sort_by_key(|p| p.name.to_lowercase());
+    Ok(out)
+}
+
+/// Stop suggesting a product name, on every PC. Past entries keep the name; typing it again
+/// (with a price in the register) brings it back.
+pub fn remove_saved_product(conn: &mut Connection, raw: &str) -> R<()> {
+    let name = clean_name(raw);
+    if name.is_empty() {
+        return Err("Choose a product to remove.".into());
+    }
+    let now = time::now_iso();
+    let tx = conn.transaction().map_err(db_err)?;
+    let changed = tx
+        .execute(
+            "UPDATE products SET deleted = 1, updated_at = ?2, version = version + 1 WHERE name = ?1 AND deleted = 0",
+            params![name, now],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        // Only ever typed on the delivery boy sheet: keep a removed entry so it isn't suggested.
+        tx.execute(
+            "INSERT INTO products (id, name, last_used_price, created_at, updated_at, deleted) VALUES (?1, ?2, 0, ?3, ?3, 1)
+             ON CONFLICT(name) DO NOTHING",
+            params![new_id(), name, now],
+        )
+        .map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1442,7 +1519,7 @@ pub fn apply_remote_delivery_boy(tx: &Transaction, b: &DeliveryBoyDTO, updated_a
 }
 
 /// Catalog entries are matched by name; the most recently used price wins.
-pub fn apply_remote_product(tx: &Transaction, name: &str, price: f64, created_at: &str, updated_at: &str) -> R<bool> {
+pub fn apply_remote_product(tx: &Transaction, name: &str, price: f64, deleted: bool, created_at: &str, updated_at: &str) -> R<bool> {
     let name = clean_name(name);
     if name.is_empty() {
         return Ok(false);
@@ -1455,17 +1532,18 @@ pub fn apply_remote_product(tx: &Transaction, name: &str, price: f64, created_at
         Some(l) if !newer(updated_at, &l) => Ok(false),
         Some(_) => {
             tx.execute(
-                "UPDATE products SET last_used_price = ?2, updated_at = ?3, synced_version = version WHERE name = ?1",
-                params![name, price, updated_at],
+                "UPDATE products SET last_used_price = CASE WHEN ?2 > 0 THEN ?2 ELSE last_used_price END,
+                                     deleted = ?4, updated_at = ?3, synced_version = version WHERE name = ?1",
+                params![name, price, updated_at, deleted],
             )
             .map_err(db_err)?;
             Ok(true)
         }
         None => {
             tx.execute(
-                "INSERT INTO products (id, name, last_used_price, created_at, updated_at, version, synced_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)",
-                params![new_id(), name, price, created_at, updated_at],
+                "INSERT INTO products (id, name, last_used_price, created_at, updated_at, deleted, version, synced_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 1)",
+                params![new_id(), name, price, created_at, updated_at, deleted],
             )
             .map_err(db_err)?;
             Ok(true)
@@ -1925,6 +2003,60 @@ mod tests {
         finalize_day(&mut c, serde_json::from_value(json!({})).unwrap()).unwrap();
         assert!(save(&mut c, json!({"deliveryBoyId":ramesh.id,"cash":1})).is_err());
         assert_eq!(day_end_page(&c).unwrap().sales.len(), 1); // finalized: only what was saved
+    }
+
+    #[test]
+    fn remove_saved_products() {
+        let (mut a, mut b) = (mem(), mem());
+        let boy = add_delivery_boy(&a, "Suresh").unwrap();
+        cash_in(&mut a, "Refill 14.2kg", json!(900), "123456").unwrap();
+        cash_in(&mut a, "Refil 14.2kg", json!(900), "123457").unwrap(); // a typing mistake
+        let sold = |c: &mut Connection, names: &[&str]| {
+            let products: Vec<Value> = names.iter().map(|n| json!({"name":n,"quantity":1})).collect();
+            save_delivery_sales(c, serde_json::from_value(json!({"deliveryBoyId":boy.id,"products":products})).unwrap()).unwrap();
+        };
+        sold(&mut a, &["Regulatr"]); // another, only on the delivery boy sheet
+        let names = |c: &Connection| saved_products(c).unwrap().into_iter().map(|p| (p.name, p.last_used_price)).collect::<Vec<_>>();
+        assert_eq!(
+            names(&a),
+            [("Refil 14.2kg".into(), Some(900.0)), ("Refill 14.2kg".into(), Some(900.0)), ("Regulatr".into(), None)]
+        );
+
+        remove_saved_product(&mut a, "refil 14.2KG").unwrap();
+        remove_saved_product(&mut a, "Regulatr").unwrap();
+        assert_eq!(names(&a), [("Refill 14.2kg".to_string(), Some(900.0))]);
+        assert_eq!(search_products(&a, "Ref").unwrap().len(), 1);
+        assert_eq!(sales_suggestions(&a).unwrap().products, ["Refill 14.2kg"]);
+        // Past entries keep the name; without a price it now counts as a new item.
+        assert_eq!(transactions_for_date(&a, &time::today()).unwrap().len(), 2);
+        assert!(cash_in(&mut a, "Refil 14.2kg", json!(null), "123458").unwrap_err().contains("new item"));
+        // Saving the delivery sheet again with the old line doesn't bring it back.
+        sold(&mut a, &["Regulatr", "Refill 14.2kg"]);
+        assert_eq!(sales_suggestions(&a).unwrap().products, ["Refill 14.2kg"]);
+
+        // The removal reaches the other PC.
+        let tx = b.transaction().unwrap();
+        let rows: Vec<(String, f64, bool, String, String)> = {
+            let mut stmt = a.prepare("SELECT name, last_used_price, deleted, created_at, updated_at FROM products").unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        for (n, p, d, c, u) in &rows {
+            apply_remote_product(&tx, n, *p, *d, c, u).unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(names(&b), [("Refill 14.2kg".to_string(), Some(900.0))]);
+
+        // Typed again with a price, or newly added on the sheet: suggested again.
+        cash_in(&mut a, "Refil 14.2kg", json!(950), "123458").unwrap();
+        sold(&mut a, &["Refill 14.2kg", "Regulatr"]); // still the old line: stays removed
+        sold(&mut a, &["Refill 14.2kg"]);
+        sold(&mut a, &["Refill 14.2kg", "Regulatr"]);
+        assert_eq!(
+            names(&a),
+            [("Refil 14.2kg".into(), Some(950.0)), ("Refill 14.2kg".into(), Some(900.0)), ("Regulatr".into(), None)]
+        );
+        assert!(remove_saved_product(&mut a, "  ").is_err());
     }
 
     #[test]

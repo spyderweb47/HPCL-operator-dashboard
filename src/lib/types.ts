@@ -129,6 +129,9 @@ export type DeliveryBoyDTO = { id: string; name: string; isActive: boolean; crea
 
 export type ProductSuggestion = { name: string; lastUsedPrice: number };
 
+/** Settings → Saved Products. No price: only typed on the delivery boy sheet. */
+export type SavedProductDTO = { name: string; lastUsedPrice: number | null };
+
 export type SyncState = "not_configured" | "connecting" | "syncing" | "online" | "offline" | "error";
 
 export type SyncStatusDTO = {

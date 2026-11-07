@@ -217,6 +217,14 @@ pub struct ProductSuggestion {
     pub last_used_price: f64,
 }
 
+/// Settings → Saved Products. No price: only typed on the delivery boy sheet.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProductDTO {
+    pub name: String,
+    pub last_used_price: Option<f64>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {

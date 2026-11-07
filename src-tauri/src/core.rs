@@ -203,6 +203,12 @@ pub async fn dispatch(core: &Arc<Core>, cmd: &str, args: Value) -> R<Value> {
             out(cloud::history_day(core, &a.date).await?)
         }
 
+        "saved_products" => out(core.with_db(|c| store::saved_products(c))?),
+        "remove_saved_product" => {
+            let a: Name = arg(args)?;
+            write(out(core.with_db(|c| store::remove_saved_product(c, &a.name))?))
+        }
+
         "list_delivery_boys" => out(core.with_db(|c| store::list_delivery_boys(c))?),
         "add_delivery_boy" => {
             let a: Name = arg(args)?;

@@ -492,7 +492,10 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
 
     // Products: one per (machine, lower-case name).
     let mut stmt = conn
-        .prepare_cached("SELECT id, name, last_used_price, created_at, updated_at, version FROM products WHERE version > synced_version LIMIT ?1")
+        .prepare_cached(
+            "SELECT id, name, last_used_price, created_at, updated_at, version, deleted FROM products
+             WHERE version > synced_version LIMIT ?1",
+        )
         .map_err(db_err)?;
     let rows = stmt
         .query_map([BATCH], |r| {
@@ -508,6 +511,7 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "name": &name,
                     "nameKey": &key,
                     "lastUsedPrice": r.get::<_, f64>(2)?,
+                    "deleted": r.get::<_, bool>(6)?,
                     "localId": &id,
                     "createdAt": date(&r.get::<_, String>(3)?),
                     "updatedAt": date(&r.get::<_, String>(4)?),
@@ -928,7 +932,7 @@ fn apply_docs(conn: &mut Connection, coll: &str, docs: &[Document]) -> R<usize> 
                 let boy = DeliveryBoyDTO { id: doc_id(d, "_id"), name: s(d, "name"), is_active: d.get_bool("isActive").unwrap_or(true), created_at };
                 store::apply_remote_delivery_boy(&tx, &boy, &updated_at)?
             }
-            PRODUCTS => store::apply_remote_product(&tx, &s(d, "name"), num(d, "lastUsedPrice"), &created_at, &updated_at)?,
+            PRODUCTS => store::apply_remote_product(&tx, &s(d, "name"), num(d, "lastUsedPrice"), flag(d, "deleted"), &created_at, &updated_at)?,
             DAY_END_LOGS => store::apply_remote_day(&tx, &day_copy_from_doc(d))?,
             OFFICE_SETTINGS => store::apply_remote_setting(&tx, &doc_id(d, "_id"), &s(d, "value"), opt_s(d, "updatedByUser").as_deref(), &updated_at)?,
             DELIVERY_SALES => store::apply_remote_sales(&tx, &s(d, "dateString"), &sales_from_doc(d), &created_at, &updated_at)?,

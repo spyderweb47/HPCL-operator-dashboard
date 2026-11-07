@@ -11,6 +11,7 @@ in real time whenever the internet is available.
 - **Delivery boys on the Day End page.** A sheet with one row per delivery boy for the day: what he **sold** (product + quantity; usually one product, sometimes more, or none; his usual product is offered in grey, so typing the quantity is enough), the **money he reports**: Cash and Online as totals, and each **System** payment on its own line with the consumer number and an optional name (filled in by itself for a consumer seen before), at the fixed System price, and his **expenses** (fuel, service, anything else). Product and expense names autocomplete like the register's product box (type, `Tab` to fill in, `Esc` to keep a new name); new names are remembered for next time. Each row shows the **cash to hand over** (cash − expenses) and the cash + online received; System payments are totalled on their own. A Total row adds up all delivery boys. Saves itself as you type; locked by Finalize; shown in History.
 - **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online entries.
 - **System payments have a fixed price**, set once in **Settings → System Payment Price** (shared by the office's PCs). Ticking System on a Cash In fills the price in by itself (it can't be typed), and every delivery boy system payment takes it too. Changing the price affects new payments only. Their total shows in the Cash In card's split (Cash · Online · System).
+- **Saved products** (Settings → Saved Products): every product name the register and the delivery boy sheet suggest, with its last price. A misspelt or unused name can be removed: it stops being suggested on all the office's PCs (past entries keep it). Typing it again saves it again; in the register it then needs its price, like a new item.
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
 
 ## How offline and sync work
@@ -147,9 +148,9 @@ Indexes: `{dateString}`, `{deliveryBoyId, dateString}`, `{systemPayments.consume
 { _id: "uuid", machineId, updatedBy, name: "Suresh Patil", isActive: true, createdAt: Date, updatedAt: Date, syncedAt: Date }
 ```
 
-**`products`**: the adaptive catalog (ghost prices), one copy per PC. Unique index: `{machineId, nameKey}`. The newest `updatedAt` per `nameKey` is the office's current price.
+**`products`**: the adaptive catalog (ghost prices), one copy per PC. Unique index: `{machineId, nameKey}`. The newest `updatedAt` per `nameKey` is the office's current price, and whether it was removed in Settings (`deleted: true`, v1.9+; `lastUsedPrice: 0` = only typed on the delivery boy sheet).
 ```js
-{ machineId, name: "Regulator", nameKey: "regulator", lastUsedPrice: 350.0, localId: "uuid",
+{ machineId, name: "Regulator", nameKey: "regulator", lastUsedPrice: 350.0, deleted: false, localId: "uuid",
   createdAt: Date, updatedAt: Date, syncedAt: Date }
 ```
 

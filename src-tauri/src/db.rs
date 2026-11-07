@@ -151,6 +151,11 @@ CREATE TABLE office_settings (
   synced_version  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX office_settings_pending ON office_settings (id) WHERE version > synced_version;
+"#, r#"
+-- v1.9: product names removed from Settings → Saved Products. The row stays (so the removal syncs
+-- to the other PCs) but is no longer suggested; using the name again brings it back.
+-- last_used_price = 0: a name only ever typed on the delivery boy sheet, with no register price.
+ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
