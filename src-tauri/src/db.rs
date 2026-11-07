@@ -156,6 +156,10 @@ CREATE INDEX office_settings_pending ON office_settings (id) WHERE version > syn
 -- to the other PCs) but is no longer suggested; using the name again brings it back.
 -- last_used_price = 0: a name only ever typed on the delivery boy sheet, with no register price.
 ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+"#, r#"
+-- v1.10: part online, part cash. On an Online entry, the part paid online when the rest was paid
+-- in cash; NULL = all of it online (and on every Cash or System entry).
+ALTER TABLE transactions ADD COLUMN online_amount REAL;
 "#];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

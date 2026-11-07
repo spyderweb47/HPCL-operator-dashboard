@@ -23,6 +23,10 @@ pub struct AuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_payment_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_online_amount: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_online_amount: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_quantity: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_quantity: Option<i64>,
@@ -48,6 +52,9 @@ pub struct TransactionDTO {
     pub is_other_product: bool,
     /// "CASH" | "ONLINE" | "SYSTEM"
     pub payment_mode: String,
+    /// Online entries paid part online, part cash: the online part (the rest is cash).
+    /// None = all of it in the payment type.
+    pub online_amount: Option<f64>,
     /// Machine ID of the PC that made the entry.
     pub created_by: Option<String>,
     /// That PC's name, when known.

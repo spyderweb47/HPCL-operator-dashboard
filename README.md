@@ -9,7 +9,7 @@ in real time whenever the internet is available.
 - **Several PCs, one office.** Every PC set to the same cloud database shares one register, product catalog, delivery boys and day end, updated within a few seconds. See [Several PCs in one office](#several-pcs-in-one-office).
 - **Your name** (Settings → Your Name): a plain name, no password. Every entry, edit and delete made on that PC carries it in the cloud (`createdByUser`, `updatedByUser`, and `user` in each audit step), so the office can see who did what.
 - **Delivery boys on the Day End page.** A sheet with one row per delivery boy for the day: what he **sold** (product + quantity; usually one product, sometimes more, or none; his usual product is offered in grey, so typing the quantity is enough), the **money he reports**: Cash and Online as totals, and each **System** payment on its own line with the consumer number and an optional name (filled in by itself for a consumer seen before), at the fixed System price, and his **expenses** (fuel, service, anything else). Product and expense names autocomplete like the register's product box (type, `Tab` to fill in, `Esc` to keep a new name); new names are remembered for next time. Each row shows the **cash to hand over** (cash − expenses) and the cash + online received; System payments are totalled on their own. A Total row adds up all delivery boys. Saves itself as you type; locked by Finalize; shown in History.
-- **Payment type** on every entry: Cash by default, or tick **Online** / **System**. Net Cash counts cash only (what should be in the drawer); the Cash In / Cash Out cards show the split on days with online entries.
+- **Cash and Online boxes, side by side, instead of one price:** the price is cash + online. Fill either one, or both when it was paid part each way (e.g. 500 cash + 400 online = 900); at least one is needed, except that leaving both empty for a known product saves its last price in cash. Net Cash counts only the cash (what should be in the drawer); the Cash In / Cash Out cards show the split. The **System** tick sits under **Other product**; System payments are paid in full, so ticking it shows one System amount instead of the two boxes. Editing an entry uses the same Cash and Online boxes and a System tick.
 - **System payments have a fixed price**, set once in **Settings → System Payment Price** (shared by the office's PCs). Ticking System on a Cash In fills the price in by itself (it can't be typed), and every delivery boy system payment takes it too. Changing the price affects new payments only. Their total shows in the Cash In card's split (Cash · Online · System).
 - **Saved products** (Settings → Saved Products): every product name the register and the delivery boy sheet suggest, with its last price. A misspelt or unused name can be removed: it stops being suggested on all the office's PCs (past entries keep it). Typing it again saves it again; in the register it then needs its price, like a new item.
 - The previous Next.js web version is kept in `legacy-web/` for reference and isn't used by this app.
@@ -102,12 +102,14 @@ Every document has `machineId`. Times are BSON dates in UTC; `dateString` is the
 { _id: "uuid", machineId, dateString: "2026-10-30", type: "CASH_IN" | "CASH_OUT",
   productName: "Regulator", price: 350.0, consumerNo: "123456" | null, isOtherProduct: false,
   paymentMode: "CASH" | "ONLINE" | "SYSTEM",   // missing on entries from before v1.4 = "CASH"
+  onlineAmount: 400.0 | null,                  // ONLINE only (v1.10+): the part paid online, the rest (price − onlineAmount) was cash; null = all online
   roleId: "delivery boy uuid" | null, roleName: "Suresh Patil" | null,   // only on entries made for a delivery boy with v1.6–1.7
   quantity: 3 | null,                          // same (the Role box was removed in v1.8)
   createdByUser: "Ramesh" | null, updatedByUser: "Ravi" | null,   // names from Settings (v1.6+)
   status: "ACTIVE" | "EDITED" | "DELETED", isDayFinalized: false,
   auditLog: [{ action: "CREATED"|"UPDATED"|"DELETED", previousProductName, newProductName, previousPrice, newPrice,
-               previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, previousQuantity, newQuantity,
+               previousConsumerNo, newConsumerNo, previousPaymentMode, newPaymentMode, previousOnlineAmount, newOnlineAmount,
+               previousQuantity, newQuantity,
                user: "Ramesh", machineId: "PC that made this step", timestamp: Date }],
   createdAt: Date, updatedAt: Date, syncedAt: Date,
   updatedBy: "machine id" }   // machineId = the PC that made the entry; updatedBy = the PC that changed it last
@@ -157,6 +159,7 @@ Indexes: `{dateString}`, `{deliveryBoyId, dateString}`, `{systemPayments.consume
 **Rules for the dashboard:**
 - Treat these collections as **written by the PCs**. If the dashboard edits a document, the PC will overwrite it the next time that row changes locally.
 - Totals exclude `status: "DELETED"`.
+- Cash vs online: an `ONLINE` entry with `onlineAmount` counts `onlineAmount` as online and `price − onlineAmount` as cash.
 - A day is closed when any of its `dayendlogs` copies has `isFinalized: true`.
 - An office's totals are over all `machineId`s in the database.
 
@@ -166,15 +169,17 @@ Indexes: `{dateString}`, `{deliveryBoyId, dateString}`, `{systemPayments.consume
 | --- | --- | --- |
 | `F2` | anywhere | Switch Cash In / Cash Out (goes back to Cash In after each save) |
 | `F3` | anywhere | Tick or untick **Other product**: Cash In without a consumer number (the box then takes any text) |
-| `F4` / `F6` | anywhere | Tick or untick **Online** / **System** payment. Neither ticked = Cash; goes back to Cash after each save. |
-| type, `↑`/`↓`, `Tab`/`Enter` | Product | Autocomplete from the catalog, then go to Consumer No (Cash In) or Price |
+| `F4` | anywhere | Jump to the **Online** box |
+| `F6` | anywhere | Tick or untick **System** payment (untick goes back to the Cash and Online boxes; reset after each save) |
+| `Tab` | Cash | Go to **Online**; `Enter` in either box saves, `Esc` in Online goes back to Cash |
+| type, `↑`/`↓`, `Tab`/`Enter` | Product | Autocomplete from the catalog, then go to Consumer No (Cash In) or Cash |
 | `Esc` | Product | Keep the typed text as a **new item** |
-| `Enter`/`Tab` | Consumer No | Go to Price. Blocked until it's exactly 6 digits (or empty with Other product). |
+| `Enter`/`Tab` | Consumer No | Go to Cash. Blocked until it's exactly 6 digits (or empty with Other product). |
 | type, `↑`/`↓`, `Tab`/`Enter` | Day End product / expense name | Autocomplete from names used before (and the catalog), then go to the next box |
 | `Esc` | Day End product / expense name | Keep the typed text as a **new name** |
 | `Enter` | Day End delivery boy row | Next box of the row |
-| `Enter` | Price | Save. Empty Price uses the grey ghost price. |
-| `Esc` | Consumer No / Price | Go back one box |
+| `Enter` | Cash / Online | Save. Both empty uses the grey ghost price (in cash). |
+| `Esc` | Consumer No / Cash | Go back one box |
 | `Enter` / `Esc` | inline row edit | Save / cancel |
 | `Ctrl+S` | Day End | Save now (it also saves by itself a moment after each change) |
 

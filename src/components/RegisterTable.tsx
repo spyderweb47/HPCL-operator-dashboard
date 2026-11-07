@@ -3,7 +3,7 @@ import { Bike, Check, CloudUpload, Eye, EyeOff, Loader2, Pencil, Trash2, X } fro
 import { mutate } from "@/lib/api";
 import { formatDateTime, formatTime } from "@/lib/date";
 import { formatINR } from "@/lib/format";
-import { PAYMENT_LABEL, PAYMENT_MODES, PAYMENT_TAG } from "@/lib/payment";
+import { PAYMENT_LABEL, PAYMENT_TAG, splitOf, splitText } from "@/lib/payment";
 import { useQuery } from "@/lib/useQuery";
 import type { AuditEntryDTO, OfficeSettingsDTO, PaymentMode, TransactionDTO } from "@/lib/types";
 
@@ -24,9 +24,12 @@ function describeAudit(a: AuditEntryDTO) {
   const when = formatDateTime(a.timestamp);
   // Payment type is shown when it isn't cash, and on both sides whenever an edit changed it.
   const modeChanged = a.previousPaymentMode && a.newPaymentMode && a.previousPaymentMode !== a.newPaymentMode;
-  const pm = (m?: PaymentMode) => (modeChanged ? ` · ${PAYMENT_LABEL[m ?? "CASH"]}` : paid(m));
-  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}${qty(a.previousQuantity)}${pm(a.previousPaymentMode)}`;
-  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}${qty(a.newQuantity)}${pm(a.newPaymentMode)}`;
+  const pm = (m?: PaymentMode, price?: number, online?: number) => {
+    const split = splitOf(price ?? 0, m, online);
+    return split ? ` · ${splitText(split)}` : modeChanged ? ` · ${PAYMENT_LABEL[m ?? "CASH"]}` : paid(m);
+  };
+  const prev = `${a.previousProductName} @ ${formatINR(a.previousPrice ?? 0)}${cn(a.previousConsumerNo)}${qty(a.previousQuantity)}${pm(a.previousPaymentMode, a.previousPrice, a.previousOnlineAmount)}`;
+  const next = `${a.newProductName} @ ${formatINR(a.newPrice ?? 0)}${cn(a.newConsumerNo)}${qty(a.newQuantity)}${pm(a.newPaymentMode, a.newPrice, a.newOnlineAmount)}`;
   const by = a.user ? ` · by ${a.user}` : "";
   if (a.action === "CREATED") return `${when} · Created: ${next}${by}`;
   if (a.action === "DELETED") return `${when} · Deleted (was ${prev})${by}`;
@@ -38,7 +41,9 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const [draftName, setDraftName] = useState("");
   const [draftPrice, setDraftPrice] = useState("");
   const [draftConsumer, setDraftConsumer] = useState("");
-  const [draftPayment, setDraftPayment] = useState<PaymentMode>("CASH");
+  // Like the entry bar: the price is Cash + Online (either or both), or one System amount.
+  const [draftSystem, setDraftSystem] = useState(false);
+  const [draftOnline, setDraftOnline] = useState(""); // draftPrice holds the cash part (or the System amount)
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDeleted, setShowDeleted] = useState(true);
@@ -46,7 +51,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
   // A System Cash In keeps its fixed price; one switched to System takes today's (Settings).
   const { data: officeSettings } = useQuery<OfficeSettingsDTO>("get_office_settings");
   const fixedPriceOf = (r: TransactionDTO) =>
-    r.type === "CASH_IN" && draftPayment === "SYSTEM" ? (r.paymentMode === "SYSTEM" ? r.price : (officeSettings?.systemPrice ?? null)) : undefined;
+    r.type === "CASH_IN" && draftSystem ? (r.paymentMode === "SYSTEM" ? r.price : (officeSettings?.systemPrice ?? null)) : undefined;
 
   const deletedCount = rows.filter((r) => r.status === "DELETED").length;
   // Entries from more than one operator or PC of the office: show who made each one.
@@ -57,9 +62,12 @@ export function RegisterTable({ rows, editable, title }: Props) {
   const startEdit = (r: TransactionDTO) => {
     setEditingId(r.id);
     setDraftName(r.productName);
-    setDraftPrice(String(r.price));
     setDraftConsumer(r.roleId ? String(r.quantity ?? "") : (r.consumerNo ?? ""));
-    setDraftPayment(r.paymentMode ?? "CASH");
+    setDraftSystem(r.paymentMode === "SYSTEM");
+    const split = splitOf(r.price, r.paymentMode, r.onlineAmount);
+    const allOnline = r.paymentMode === "ONLINE" && !split;
+    setDraftPrice(split ? String(split.cash) : allOnline ? "" : String(r.price));
+    setDraftOnline(split ? String(split.online) : allOnline ? String(r.price) : "");
     setError(null);
   };
 
@@ -70,15 +78,19 @@ export function RegisterTable({ rows, editable, title }: Props) {
 
   const saveEdit = (r: TransactionDTO) => {
     const id = r.id;
+    const cash = Number(draftPrice) || 0;
+    const online = draftSystem ? 0 : Number(draftOnline) || 0;
+    if (!draftSystem && cash + online <= 0) return setError("Enter the cash or online amount.");
     setBusyId(id);
     startTransition(async () => {
       // Delivery boy entries edit the quantity in the box where others edit the consumer number.
       const res = await mutate("update_transaction", {
         id,
         productName: draftName,
-        price: draftPrice,
+        price: draftSystem ? draftPrice : (Math.round((cash + online) * 100) / 100).toFixed(2),
         ...(r.roleId ? { quantity: draftConsumer || null } : { consumerNo: draftConsumer }),
-        paymentMode: draftPayment,
+        paymentMode: draftSystem ? "SYSTEM" : online > 0 ? "ONLINE" : "CASH",
+        onlineAmount: !draftSystem && cash > 0 && online > 0 ? online.toFixed(2) : null,
       });
       setBusyId(null);
       if (res.ok) {
@@ -162,6 +174,7 @@ export function RegisterTable({ rows, editable, title }: Props) {
               const canChange = editable && !deleted && !r.isDayFinalized;
               const history = r.auditLog.map(describeAudit).join("\n");
               const cashIn = r.type === "CASH_IN";
+              const split = splitOf(r.price, r.paymentMode, r.onlineAmount);
               return (
                 <tr
                   key={r.id}
@@ -195,19 +208,26 @@ export function RegisterTable({ rows, editable, title }: Props) {
                       {cashIn ? "CASH IN" : "CASH OUT"}
                     </span>
                     {editing ? (
-                      <select
-                        aria-label="Payment"
-                        value={draftPayment}
-                        onChange={(e) => setDraftPayment(e.target.value as PaymentMode)}
-                        onKeyDown={(e) => onEditKeyDown(e, r)}
-                        className="mt-1 block w-full rounded border border-slate-300 bg-white px-1 py-0.5 text-xs outline-none focus:border-hp-blue"
+                      <label className="mt-1 flex w-fit cursor-pointer select-none items-center gap-1 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-xs font-medium text-slate-600 has-[:checked]:border-orange-500 has-[:checked]:bg-orange-50 has-[:checked]:text-orange-800">
+                        <input
+                          type="checkbox"
+                          aria-label="System payment"
+                          checked={draftSystem}
+                          onChange={(e) => setDraftSystem(e.target.checked)}
+                          onKeyDown={(e) => onEditKeyDown(e, r)}
+                          className="h-3 w-3 accent-orange-600"
+                        />
+                        System
+                      </label>
+                    ) : split ? (
+                      <span
+                        title={`Paid ${splitText(split)}: only the cash part counts in Net Cash`}
+                        className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                          deleted ? "bg-slate-200 text-slate-500" : PAYMENT_TAG.ONLINE
+                        }`}
                       >
-                        {PAYMENT_MODES.map((m) => (
-                          <option key={m} value={m}>
-                            {PAYMENT_LABEL[m]}
-                          </option>
-                        ))}
-                      </select>
+                        Online + Cash
+                      </span>
                     ) : (
                       r.paymentMode &&
                       r.paymentMode !== "CASH" && (
@@ -312,18 +332,51 @@ export function RegisterTable({ rows, editable, title }: Props) {
                         onKeyDown={(e) => onEditKeyDown(e, r)}
                         className="w-28 rounded border border-orange-300 bg-orange-50 px-2 py-1 text-right text-orange-900 outline-none placeholder:text-xs focus:border-hp-blue"
                       />
-                    ) : editing ? (
+                    ) : editing && draftSystem ? (
                       <input
                         inputMode="decimal"
+                        aria-label="System amount"
                         value={draftPrice}
                         onChange={(e) => setDraftPrice(e.target.value.replace(/[^\d.]/g, ""))}
                         onKeyDown={(e) => onEditKeyDown(e, r)}
-                        className="w-28 rounded border border-slate-300 px-2 py-1 text-right outline-none focus:border-hp-blue"
+                        className="w-28 rounded border border-orange-300 bg-orange-50 px-2 py-1 text-right outline-none focus:border-hp-blue"
                       />
-                    ) : (
-                      <span className={deleted ? "line-through" : `font-semibold ${cashIn ? "text-emerald-700" : "text-rose-700"}`}>
-                        {cashIn ? "+" : "−"} {formatINR(r.price)}
+                    ) : editing ? (
+                      <span className="flex justify-end gap-1">
+                        <input
+                          inputMode="decimal"
+                          aria-label="Cash"
+                          title="Cash"
+                          placeholder="Cash"
+                          value={draftPrice}
+                          onFocus={(e) => e.target.select()}
+                          onChange={(e) => setDraftPrice(e.target.value.replace(/[^\d.]/g, ""))}
+                          onKeyDown={(e) => onEditKeyDown(e, r)}
+                          className="w-24 rounded border border-slate-300 px-2 py-1 text-right outline-none placeholder:text-xs focus:border-emerald-600"
+                        />
+                        <input
+                          inputMode="decimal"
+                          aria-label="Online"
+                          title="Online"
+                          placeholder="Online"
+                          value={draftOnline}
+                          onFocus={(e) => e.target.select()}
+                          onChange={(e) => setDraftOnline(e.target.value.replace(/[^\d.]/g, ""))}
+                          onKeyDown={(e) => onEditKeyDown(e, r)}
+                          className="w-24 rounded border border-violet-300 bg-violet-50/40 px-2 py-1 text-right outline-none placeholder:text-xs placeholder:text-violet-400 focus:border-violet-500"
+                        />
                       </span>
+                    ) : (
+                      <>
+                        <span className={deleted ? "line-through" : `font-semibold ${cashIn ? "text-emerald-700" : "text-rose-700"}`}>
+                          {cashIn ? "+" : "−"} {formatINR(r.price)}
+                        </span>
+                        {split && (
+                          <span className="block whitespace-nowrap text-[11px] text-slate-500">
+                            <span className="text-violet-700">{formatINR(split.online)} online</span> · {formatINR(split.cash)} cash
+                          </span>
+                        )}
+                      </>
                     )}
                   </td>
                   {editable && (

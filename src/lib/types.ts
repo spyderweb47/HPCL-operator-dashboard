@@ -13,6 +13,8 @@ export type AuditEntryDTO = {
   newConsumerNo?: string;
   previousPaymentMode?: PaymentMode;
   newPaymentMode?: PaymentMode;
+  previousOnlineAmount?: number;
+  newOnlineAmount?: number;
   previousQuantity?: number;
   newQuantity?: number;
   /** Operator name (Settings) and PC that made this change. */
@@ -30,6 +32,8 @@ export type TransactionDTO = {
   consumerNo: string | null;
   isOtherProduct: boolean;
   paymentMode: PaymentMode;
+  /** Online entries paid part online, part cash: the online part (the rest is cash). null = all online. */
+  onlineAmount?: number | null;
   /** Machine ID of the PC that made the entry, and that PC's name when known. */
   createdBy: string | null;
   createdByName: string | null;

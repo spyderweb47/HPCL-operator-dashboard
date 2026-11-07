@@ -98,6 +98,21 @@ fn parse_payment_mode(v: Option<&str>) -> R<&'static str> {
     PAYMENT_MODES.into_iter().find(|m| m.eq_ignore_ascii_case(v)).ok_or_else(|| format!("Unknown payment type \"{v}\"."))
 }
 
+const ONLINE_PART_INVALID: &str = "The online part must be less than the price (the rest is cash). Leave it empty if all of it was paid online.";
+
+/// Part online, part cash: the online part of an Online entry. Empty, or the whole price, means
+/// all of it online (None). Cash and System entries have none.
+fn parse_online_part(v: &Value, payment_mode: &str, price: f64) -> R<Option<f64>> {
+    if payment_mode != "ONLINE" {
+        return Ok(None);
+    }
+    match parse_price(v).map_err(|_| ONLINE_PART_INVALID.to_string())? {
+        Some(part) if part < price => Ok(Some(part)),
+        Some(part) if part > price => Err(ONLINE_PART_INVALID.into()),
+        _ => Ok(None),
+    }
+}
+
 /// Quantity on delivery boy entries made with v1.6–1.7 (editable on those rows only).
 /// A whole number from 1 to QUANTITY_MAX. Empty -> Ok(None).
 fn parse_quantity(v: &Value) -> R<Option<i64>> {
@@ -215,7 +230,7 @@ const TX_COLS: &str = "id, date_string, type, product_name, price, consumer_no, 
                        COALESCE(created_by, (SELECT value FROM meta WHERE key = 'machine_id')), \
                        (SELECT device_name FROM machines \
                          WHERE machines.id = COALESCE(transactions.created_by, (SELECT value FROM meta WHERE key = 'machine_id'))), \
-                       created_by_user, updated_by_user, role_id, role_name, quantity";
+                       created_by_user, updated_by_user, role_id, role_name, quantity, online_amount";
 
 fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
     let audit: String = r.get(10)?;
@@ -230,6 +245,7 @@ fn tx_from_row(r: &Row) -> rusqlite::Result<TransactionDTO> {
         consumer_no: r.get(5)?,
         is_other_product: r.get(6)?,
         payment_mode: r.get(13)?,
+        online_amount: r.get(21)?,
         created_by: r.get(14)?,
         created_by_name: r.get(15)?,
         created_by_user: r.get(16)?,
@@ -314,6 +330,9 @@ pub struct CreateTxInput {
     /// "CASH" (default) | "ONLINE" | "SYSTEM". A System Cash In always takes the fixed System price.
     #[serde(default)]
     pub payment_mode: Option<String>,
+    /// Online only: the part paid online when the rest was cash. Empty = all online.
+    #[serde(default)]
+    pub online_amount: Value,
 }
 
 pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<TransactionDTO> {
@@ -358,6 +377,7 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         price = Some(last.ok_or_else(|| format!("\"{name}\" is a new item — enter its price."))?);
     }
     let price = price.unwrap_or_default();
+    let online_amount = parse_online_part(&input.online_amount, payment_mode, price)?;
     let product_name = if fixed { add_product(&tx, &name, price, &now)? } else { touch_product(&tx, &name, price, &now)? };
 
     let audit = vec![AuditEntry {
@@ -366,6 +386,7 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
         new_price: Some(price),
         new_consumer_no: consumer_no.clone(),
         new_payment_mode: Some(payment_mode.into()),
+        new_online_amount: online_amount,
         user: user.clone(),
         machine_id: machine,
         timestamp: now.clone(),
@@ -374,11 +395,12 @@ pub fn create_transaction(conn: &mut Connection, input: CreateTxInput) -> R<Tran
     let id = new_id();
     tx.execute(
         "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product,
-                                   status, audit_log, created_at, updated_at, payment_mode, created_by_user, updated_by_user)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10, ?11, ?11)",
+                                   status, audit_log, created_at, updated_at, payment_mode, created_by_user, updated_by_user,
+                                   online_amount)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ACTIVE', ?8, ?9, ?9, ?10, ?11, ?11, ?12)",
         params![
             id, date, kind, product_name, price, consumer_no, is_other, serde_json::to_string(&audit).unwrap_or_default(), now,
-            payment_mode, user
+            payment_mode, user, online_amount
         ],
     )
     .map_err(db_err)?;
@@ -414,11 +436,12 @@ fn save_change(tx: &Transaction, row: &TransactionDTO, status: &str, entry: Audi
     audit.push(AuditEntry { user: user.clone(), machine_id: machine, ..entry });
     tx.execute(
         "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, audit_log = ?6,
-                                 updated_at = ?7, payment_mode = ?8, quantity = ?9, updated_by_user = ?10, version = version + 1
+                                 updated_at = ?7, payment_mode = ?8, quantity = ?9, updated_by_user = ?10, online_amount = ?11,
+                                 version = version + 1
          WHERE id = ?1",
         params![
             row.id, row.product_name, row.price, row.consumer_no, status, serde_json::to_string(&audit).unwrap_or_default(), now,
-            row.payment_mode, row.quantity, user
+            row.payment_mode, row.quantity, user, row.online_amount
         ],
     )
     .map_err(db_err)?;
@@ -437,6 +460,9 @@ pub struct UpdateTxInput {
     /// Absent = keep the entry's payment type.
     #[serde(default)]
     pub payment_mode: Option<String>,
+    /// Online only: the part paid online when the rest was cash. Empty = all online.
+    #[serde(default)]
+    pub online_amount: Value,
     /// Delivery boy Cash In entries only.
     #[serde(default)]
     pub quantity: Value,
@@ -463,6 +489,7 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
     } else {
         parse_price(&input.price).ok().flatten().ok_or(INVALID_PRICE)?
     };
+    let online_amount = parse_online_part(&input.online_amount, &payment_mode, price)?;
 
     // Consumer number only applies to Cash In; the Other-product flag is fixed at entry time.
     // Other products keep free text there, which can be added, changed or cleared.
@@ -485,6 +512,7 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         && price == old.price
         && consumer_no == old.consumer_no
         && payment_mode == old.payment_mode
+        && online_amount == old.online_amount
         && quantity == old.quantity
     {
         return Ok(());
@@ -509,12 +537,14 @@ pub fn update_transaction(conn: &mut Connection, input: UpdateTxInput) -> R<()> 
         new_consumer_no: consumer_no.clone(),
         previous_payment_mode: Some(old.payment_mode.clone()),
         new_payment_mode: Some(payment_mode.clone()),
+        previous_online_amount: old.online_amount,
+        new_online_amount: online_amount,
         previous_quantity: old.quantity,
         new_quantity: quantity,
         timestamp: now.clone(),
         ..Default::default()
     };
-    let new = TransactionDTO { product_name, price, consumer_no, payment_mode, quantity, ..old };
+    let new = TransactionDTO { product_name, price, consumer_no, payment_mode, online_amount, quantity, ..old };
     save_change(&tx, &new, "EDITED", entry, &now)?;
     tx.commit().map_err(db_err)
 }
@@ -530,6 +560,7 @@ pub fn delete_transaction(conn: &mut Connection, id: &str) -> R<()> {
         previous_price: Some(row.price),
         previous_consumer_no: row.consumer_no.clone(),
         previous_payment_mode: Some(row.payment_mode.clone()),
+        previous_online_amount: row.online_amount,
         previous_quantity: row.quantity,
         timestamp: now.clone(),
         ..Default::default()
@@ -1466,12 +1497,12 @@ pub fn apply_remote_tx(tx: &Transaction, t: &TransactionDTO, updated_at: &str) -
             tx.execute(
                 "INSERT INTO transactions (id, date_string, type, product_name, price, consumer_no, is_other_product, status,
                     is_day_finalized, audit_log, created_at, updated_at, payment_mode, created_by,
-                    role_id, role_name, quantity, created_by_user, updated_by_user, version, synced_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, 1)",
+                    role_id, role_name, quantity, created_by_user, updated_by_user, online_amount, version, synced_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 1, 1)",
                 params![
                     t.id, t.date_string, t.kind, t.product_name, t.price, t.consumer_no, t.is_other_product, t.status,
                     finalized, audit, t.created_at, updated_at, t.payment_mode, t.created_by,
-                    t.role_id, t.role_name, t.quantity, t.created_by_user, t.updated_by_user
+                    t.role_id, t.role_name, t.quantity, t.created_by_user, t.updated_by_user, t.online_amount
                 ],
             )
             .map_err(db_err)?;
@@ -1481,11 +1512,11 @@ pub fn apply_remote_tx(tx: &Transaction, t: &TransactionDTO, updated_at: &str) -
             tx.execute(
                 "UPDATE transactions SET product_name = ?2, price = ?3, consumer_no = ?4, status = ?5, is_day_finalized = ?6,
                     audit_log = ?7, updated_at = ?8, payment_mode = ?9, created_by = COALESCE(?10, created_by),
-                    quantity = ?11, updated_by_user = ?12, synced_version = version
+                    quantity = ?11, updated_by_user = ?12, online_amount = ?13, synced_version = version
                  WHERE id = ?1",
                 params![
                     t.id, t.product_name, t.price, t.consumer_no, t.status, t.is_day_finalized || local_final, audit,
-                    updated_at, t.payment_mode, t.created_by, t.quantity, t.updated_by_user
+                    updated_at, t.payment_mode, t.created_by, t.quantity, t.updated_by_user, t.online_amount
                 ],
             )
             .map_err(db_err)?;
@@ -1839,6 +1870,45 @@ mod tests {
         let row = transactions_for_date(&c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
         assert_eq!(row.price, 300.0);
         assert!(update(&mut c, json!({"id":t.id,"productName":"Refill","price":950,"consumerNo":"123456","paymentMode":"bad"})).is_err());
+    }
+
+    #[test]
+    fn part_online_part_cash() {
+        let mut c = mem();
+        let make = |c: &mut Connection, body: Value| create_transaction(c, serde_json::from_value(body).unwrap());
+        let sale = |mode: &str, online: Value| json!({"type":"CASH_IN","productName":"Refill","price":900,"consumerNo":"123456","paymentMode":mode,"onlineAmount":online});
+        // ₹400 online, the other ₹500 in cash.
+        let t = make(&mut c, sale("ONLINE", json!("400"))).unwrap();
+        assert_eq!((t.payment_mode.as_str(), t.online_amount, t.audit_log[0].new_online_amount), ("ONLINE", Some(400.0), Some(400.0)));
+        // Empty or the whole price: all online.
+        assert_eq!(make(&mut c, sale("ONLINE", json!(""))).unwrap().online_amount, None);
+        assert_eq!(make(&mut c, sale("ONLINE", json!(900))).unwrap().online_amount, None);
+        assert_eq!(make(&mut c, sale("ONLINE", json!(1000))).unwrap_err(), ONLINE_PART_INVALID);
+        assert_eq!(make(&mut c, sale("ONLINE", json!("0"))).unwrap_err(), ONLINE_PART_INVALID);
+        // Only Online entries have a part; on Cash it is ignored.
+        assert_eq!(make(&mut c, sale("CASH", json!(400))).unwrap().online_amount, None);
+        // With the ghost price: checked against the product's last price.
+        let ghost = json!({"type":"CASH_IN","productName":"Refill","consumerNo":"123456","paymentMode":"ONLINE","onlineAmount":"300.5"});
+        assert_eq!(make(&mut c, ghost).unwrap().online_amount, Some(300.5));
+
+        let update = |c: &mut Connection, body: Value| update_transaction(c, serde_json::from_value(body).unwrap());
+        let row = |c: &Connection| transactions_for_date(c, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
+        let edit = |online: Value, mode: &str, price: i64| json!({"id":t.id,"productName":"Refill","price":price,"consumerNo":"123456","paymentMode":mode,"onlineAmount":online});
+        update(&mut c, edit(json!(600), "ONLINE", 900)).unwrap();
+        let r = row(&c);
+        assert_eq!((r.online_amount, r.audit_log[1].previous_online_amount, r.audit_log[1].new_online_amount), (Some(600.0), Some(400.0), Some(600.0)));
+        // A lower price must still leave some cash.
+        assert_eq!(update(&mut c, edit(json!(600), "ONLINE", 500)).unwrap_err(), ONLINE_PART_INVALID);
+        // Changing to Cash drops the online part.
+        update(&mut c, edit(json!(600), "CASH", 900)).unwrap();
+        assert_eq!(row(&c).online_amount, None);
+
+        // Reaches the other PC.
+        update(&mut c, edit(json!(250), "ONLINE", 900)).unwrap();
+        let mut b = mem();
+        sync(&c, &mut b);
+        let on_b = transactions_for_date(&b, &time::today()).unwrap().into_iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!(on_b.online_amount, Some(250.0));
     }
 
     #[test]

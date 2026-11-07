@@ -453,6 +453,12 @@ fn audit_doc(a: &AuditEntry) -> Document {
     if let Some(p) = a.previous_price {
         d.insert("previousPrice", p);
     }
+    if let Some(p) = a.previous_online_amount {
+        d.insert("previousOnlineAmount", p);
+    }
+    if let Some(p) = a.new_online_amount {
+        d.insert("newOnlineAmount", p);
+    }
     if let Some(p) = a.new_price {
         d.insert("newPrice", p);
     }
@@ -655,7 +661,7 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
         .prepare_cached(
             "SELECT id, date_string, type, product_name, price, consumer_no, is_other_product, status, is_day_finalized,
                     audit_log, created_at, updated_at, version, payment_mode, created_by,
-                    role_id, role_name, quantity, created_by_user, updated_by_user
+                    role_id, role_name, quantity, created_by_user, updated_by_user, online_amount
              FROM transactions WHERE version > synced_version ORDER BY created_at LIMIT ?1",
         )
         .map_err(db_err)?;
@@ -682,6 +688,8 @@ fn pending_uploads(conn: &Connection, machine_id: &str) -> R<Vec<Upload>> {
                     "consumerNo": opt_str(&r.get(5)?),
                     "isOtherProduct": r.get::<_, bool>(6)?,
                     "paymentMode": r.get::<_, String>(13)?,
+                    // Online entries paid part online, part cash: the online part (null = all of it).
+                    "onlineAmount": r.get::<_, Option<f64>>(20)?.map(Bson::Double).unwrap_or(Bson::Null),
                     // The delivery boy the entry is for (null = Office), and his cylinder count.
                     "roleId": opt_str(&r.get(15)?),
                     "roleName": opt_str(&r.get(16)?),
@@ -812,6 +820,8 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
                     new_consumer_no: opt_s(e, "newConsumerNo"),
                     previous_payment_mode: opt_s(e, "previousPaymentMode"),
                     new_payment_mode: opt_s(e, "newPaymentMode"),
+                    previous_online_amount: e.contains_key("previousOnlineAmount").then(|| num(e, "previousOnlineAmount")),
+                    new_online_amount: e.contains_key("newOnlineAmount").then(|| num(e, "newOnlineAmount")),
                     previous_quantity: e.contains_key("previousQuantity").then(|| num(e, "previousQuantity") as i64),
                     new_quantity: e.contains_key("newQuantity").then(|| num(e, "newQuantity") as i64),
                     user: opt_s(e, "user"),
@@ -840,6 +850,9 @@ fn tx_from_doc(d: &Document) -> TransactionDTO {
         payment_mode: opt_s(d, "paymentMode")
             .filter(|m| store::PAYMENT_MODES.contains(&m.as_str()))
             .unwrap_or_else(|| "CASH".into()),
+        online_amount: matches!(d.get("onlineAmount"), Some(Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_)))
+            .then(|| num(d, "onlineAmount"))
+            .filter(|p| *p > 0.0),
         status: opt_s(d, "status").unwrap_or_else(|| "ACTIVE".into()),
         is_day_finalized: flag(d, "isDayFinalized"),
         created_at: iso(d, "createdAt").unwrap_or_default(),

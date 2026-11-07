@@ -1,3 +1,4 @@
+import { splitOf } from "./payment";
 import type { PaymentMode, Totals, TransactionDTO } from "./types";
 
 // round to paise to avoid float drift in display
@@ -12,9 +13,13 @@ export function computeTotals(rows: TransactionDTO[]): Totals {
   for (const r of rows) {
     if (r.status === "DELETED") continue;
     count++;
-    const mode = r.paymentMode ?? "CASH";
-    if (r.type === "CASH_IN") inByMode[mode] += r.price;
-    else outByMode[mode] += r.price;
+    const byMode = r.type === "CASH_IN" ? inByMode : outByMode;
+    const split = splitOf(r.price, r.paymentMode, r.onlineAmount);
+    if (split) {
+      // Part online, part cash: each part counts where it was paid.
+      byMode.ONLINE += split.online;
+      byMode.CASH += split.cash;
+    } else byMode[r.paymentMode ?? "CASH"] += r.price;
   }
   const sum = (m: Record<PaymentMode, number>) => m.CASH + m.ONLINE + m.SYSTEM;
   for (const m of [inByMode, outByMode]) for (const k of Object.keys(m) as PaymentMode[]) m[k] = round(m[k]);
